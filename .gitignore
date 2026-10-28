@@ -3,3 +3,6 @@
 __pycache__/
 *.pyc
 college.db
+guide_ionic
+myenv/
+api_test.db
