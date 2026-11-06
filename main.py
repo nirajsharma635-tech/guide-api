@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import hmac
+import json
 import os
 import random
 import re
@@ -7,20 +9,25 @@ import secrets
 import shutil
 import smtplib
 import string
+import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from email.utils import parsedate_to_datetime
+from html import unescape
 from typing import Annotated, Optional
 
 import jwt
+import httpx
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from jwt.exceptions import InvalidTokenError
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
-from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, inspect, text
+from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint, and_, create_engine, func, inspect, or_, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 load_dotenv()
@@ -29,10 +36,11 @@ app = FastAPI(title="Guide API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:3000", "http://localhost:8100", "*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./college.db")
@@ -54,6 +62,10 @@ password_hash = PasswordHash.recommended()
 security = HTTPBearer()
 
 SECRET_KEY = os.getenv("SECRET_KEY", "local-dev-only-change-before-deployment")
+
+YOUPI_WEBHOOK_SECRET = os.getenv("YOUPI_WEBHOOK_SECRET", "")
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 OTP_TTL_MINUTES = 5
 OTP_VERIFIED_TTL_MINUTES = 10
@@ -81,6 +93,7 @@ class User(Base):
     class_field: Mapped[Optional[str]] = mapped_column("class", String(50), nullable=True)
     referred_by: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     wallet_balance: Mapped[Optional[float]] = mapped_column(Float, default=0, nullable=True)
+    role: Mapped[Optional[str]] = mapped_column(String(20), default="student", nullable=True, server_default="student")
 
 
 class Category(Base):
@@ -98,6 +111,7 @@ class SubCategory(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     category_id: Mapped[int] = mapped_column(Integer, index=True)
     class_level: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
+    semester: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     name: Mapped[str] = mapped_column(String(150))
 
 
@@ -267,6 +281,7 @@ class WalletTransaction(Base):
     amount: Mapped[float] = mapped_column(Float, default=0)
     purchase: Mapped[Optional[str]] = mapped_column("purchase", String(255), nullable=True)
     status: Mapped[str] = mapped_column(String(30), default="Completed")
+    reference: Mapped[Optional[str]] = mapped_column(String(120), nullable=True, unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
@@ -280,6 +295,215 @@ class EmailOtp(Base):
     verified_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     expires_at: Mapped[datetime] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Chapter(Base):
+    __tablename__ = "chapters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[int] = mapped_column(Integer, index=True)
+    unit: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    chapter_name: Mapped[str] = mapped_column(String(200))
+    chapter_num: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class Unit(Base):
+    __tablename__ = "units"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[int] = mapped_column(Integer, index=True)
+    unit_num: Mapped[int] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200))
+
+
+class StudyMaterial(Base):
+    __tablename__ = "study_materials"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    chapter_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    unit_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    material_type: Mapped[Optional[str]] = mapped_column(String(30), default="pdf")
+    file_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    semester: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+
+class Bookmark(Base):
+    __tablename__ = "bookmarks"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True)
+    material_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pdf_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    book_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class PersonalNote(Base):
+    __tablename__ = "personal_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True)
+    material_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pdf_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    page_no: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    note_text: Mapped[Text] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ReadingProgress(Base):
+    __tablename__ = "reading_progress"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True)
+    material_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pdf_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    book_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    current_page: Mapped[Optional[int]] = mapped_column(Integer, default=1)
+    total_pages: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    progress_percent: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    last_read_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AIConversation(Base):
+    __tablename__ = "ai_conversations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True)
+    title: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    subject_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    pdf_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AIMessage(Base):
+    __tablename__ = "ai_messages"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    conversation_id: Mapped[int] = mapped_column(Integer, index=True)
+    role: Mapped[str] = mapped_column(String(20))
+    content: Mapped[Text] = mapped_column(Text)
+    sources: Mapped[Optional[Text]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class ExamPaperNew(Base):
+    __tablename__ = "exam_papers_new"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    semester: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    subject_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    title: Mapped[str] = mapped_column(String(200))
+    year: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    file_path: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+
+
+class ImportantQuestion(Base):
+    __tablename__ = "important_questions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    chapter_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    question: Mapped[Text] = mapped_column(Text)
+    answer: Mapped[Optional[Text]] = mapped_column(Text, nullable=True)
+    explanation: Mapped[Optional[Text]] = mapped_column(Text, nullable=True)
+    marks: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    question_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+
+class MCQ(Base):
+    __tablename__ = "mcqs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    subject_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    chapter_id: Mapped[Optional[int]] = mapped_column(Integer, index=True)
+    question: Mapped[Text] = mapped_column(Text)
+    option_a: Mapped[str] = mapped_column(String(255))
+    option_b: Mapped[str] = mapped_column(String(255))
+    option_c: Mapped[str] = mapped_column(String(255))
+    option_d: Mapped[str] = mapped_column(String(255))
+    correct_option: Mapped[str] = mapped_column(String(1))
+    explanation: Mapped[Optional[Text]] = mapped_column(Text, nullable=True)
+
+
+class MockTest(Base):
+    __tablename__ = "mock_tests"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    subject_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    semester: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    duration_minutes: Mapped[Optional[int]] = mapped_column(Integer, default=60)
+    total_marks: Mapped[Optional[int]] = mapped_column(Integer, default=100)
+
+
+class MockTestQuestion(Base):
+    __tablename__ = "mock_test_questions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    mock_test_id: Mapped[int] = mapped_column(Integer, index=True)
+    mcq_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    question: Mapped[Text] = mapped_column(Text)
+    option_a: Mapped[str] = mapped_column(String(255))
+    option_b: Mapped[str] = mapped_column(String(255))
+    option_c: Mapped[str] = mapped_column(String(255))
+    option_d: Mapped[str] = mapped_column(String(255))
+    correct_option: Mapped[str] = mapped_column(String(1))
+    marks: Mapped[Optional[int]] = mapped_column(Integer, default=1)
+
+
+class TestAttempt(Base):
+    __tablename__ = "test_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True)
+    mock_test_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    attempt_type: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+    score: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    total: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    correct: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    incorrect: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class TestResult(Base):
+    __tablename__ = "test_results"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), index=True)
+    test_name: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    subject: Mapped[Optional[str]] = mapped_column(String(150), nullable=True)
+    score: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    total: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    percentage: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class StudentProgress(Base):
+    __tablename__ = "student_progress"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    total_tests: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    average_score: Mapped[Optional[float]] = mapped_column(Float, default=0)
+    pdf_read_count: Mapped[Optional[int]] = mapped_column(Integer, default=0)
+    last_active: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
+class DownloadEvent(Base):
+    __tablename__ = "downloads"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True, index=True)
+    content_type: Mapped[str] = mapped_column(String(50), index=True)
+    content_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -315,6 +539,108 @@ except Exception as exc:
     print(f"Warning: could not migrate users table automatically: {exc}")
 
 
+def ensure_payment_columns():
+    inspector = inspect(engine)
+    if "wallet_transactions" not in inspector.get_table_names():
+        return
+
+    existing = {column["name"] for column in inspector.get_columns("wallet_transactions")}
+    with engine.begin() as connection:
+        if "reference" not in existing:
+            connection.execute(
+                text('ALTER TABLE wallet_transactions ADD COLUMN "reference" VARCHAR(120)')
+            )
+        connection.execute(
+            text(
+                'CREATE UNIQUE INDEX IF NOT EXISTS ix_wallet_transactions_reference '
+                'ON wallet_transactions("reference")'
+            )
+        )
+
+
+try:
+    ensure_payment_columns()
+except Exception as exc:
+    print(f"Warning: could not migrate wallet_transactions table automatically: {exc}")
+
+
+def ensure_subcategory_columns():
+    inspector = inspect(engine)
+    if "subcategories" not in inspector.get_table_names():
+        return
+
+    existing = {column["name"] for column in inspector.get_columns("subcategories")}
+    with engine.begin() as connection:
+        if "semester" not in existing:
+            connection.execute(
+                text('ALTER TABLE subcategories ADD COLUMN "semester" INTEGER')
+            )
+            connection.execute(
+                text(
+                    'CREATE INDEX IF NOT EXISTS ix_subcategories_semester '
+                    'ON subcategories("semester")'
+                )
+            )
+
+
+try:
+    ensure_subcategory_columns()
+except Exception as exc:
+    print(f"Warning: could not migrate subcategories table automatically: {exc}")
+
+
+BSCIT_SUBJECTS = {
+    1: [
+        "Imperative Programming",
+        "Digital Electronics",
+        "Operating Systems",
+        "Discrete Mathematics",
+        "Communication Skills",
+    ],
+    2: [
+        "Object Oriented Programming",
+        "Numerical and Statistical Methods",
+        "Web Programming",
+        "Fundamentals of Microprocessor and Microcontrollers",
+        "Green Computing",
+    ],
+    3: [
+        "Database Management Systems",
+        "Data Structures",
+        "Computer Networks",
+        "Applied Mathematics",
+        "Python Programming",
+    ],
+    4: [
+        "Core Java",
+        "Computer Oriented Statistical Techniques",
+        "Computer Graphics and Animation",
+        "Software Engineering",
+        "Computer Organization and Architecture",
+    ],
+    5: [
+        "Advanced Web Programming",
+        "Linux System Administration",
+        "Enterprise Java",
+        "Software Project Management",
+        "Next Generation Technologies",
+        "Internet of Things",
+        "Artificial Intelligence",
+        "Network Security",
+        "Mobile Computing",
+    ],
+    6: [
+        "Software Quality Assurance",
+        "Business Intelligence",
+        "Principles of Geographic Information Systems",
+        "Cyber Laws",
+        "IT Service Management",
+        "Security in Computing",
+        "Project Work",
+    ],
+}
+
+
 def seed_defaults():
     db = SessionLocal()
     try:
@@ -331,32 +657,17 @@ def seed_defaults():
             ])
 
         if db.query(SubCategory).count() == 0:
-            subject_map = {
-                1: [
-                    "Imperative Programming",
-                    "Digital Electronics",
-                    "Operating Systems",
-                    "Discrete Mathematics",
-                    "Communication Skills",
-                ],
-                2: [
-                    "Object Oriented Programming",
-                    "Data Structures",
-                    "Database Systems",
-                    "Computer Networks",
-                    "Applied Mathematics",
-                ],
-                3: [
-                    "Software Engineering",
-                    "Web Programming",
-                    "Network Security",
-                    "Mobile Computing",
-                    "Project Work",
-                ],
-            }
-            for class_level, subjects in subject_map.items():
+            for semester, subjects in BSCIT_SUBJECTS.items():
+                class_level = (semester + 1) // 2
                 for subject in subjects:
-                    db.add(SubCategory(category_id=1, class_level=class_level, name=subject))
+                    db.add(
+                        SubCategory(
+                            category_id=1,
+                            class_level=class_level,
+                            semester=semester,
+                            name=subject,
+                        )
+                    )
 
         db.commit()
     finally:
@@ -452,6 +763,66 @@ class NoteUploadInput(BaseModel):
     subcat_id: Optional[int] = None
 
 
+class DownloadInput(BaseModel):
+    user_id: Optional[str] = None
+    content_type: str = "Unknown"
+    content_id: Optional[int] = None
+    title: Optional[str] = None
+
+
+class SubCategoryInput(BaseModel):
+    name: str
+    category_id: int = 1
+    class_level: Optional[int] = None
+    semester: Optional[int] = None
+
+
+class BookInput(BaseModel):
+    subcat_id: int
+    bookname: str
+    referencename: Optional[str] = None
+    image: Optional[str] = None
+
+
+class NoteInput(BaseModel):
+    subcat_id: int
+    chapter_num: Optional[int] = None
+    chapter_name: Optional[str] = None
+    image: Optional[str] = None
+
+
+class QuestionPaperInput(BaseModel):
+    subcat_id: int
+    title: str
+    tag: Optional[str] = None
+    image: Optional[str] = None
+
+
+class QuestionBankInput(BaseModel):
+    subcat_id: int
+    title: str
+    pdf: Optional[str] = None
+
+
+class PracticalInput(BaseModel):
+    subcat_id: int
+    syllabus_title: Optional[str] = None
+    syllabusPdf: Optional[str] = None
+    solutionPdf: Optional[str] = None
+
+
+class UnitInput(BaseModel):
+    subject_id: int
+    unit_num: int
+    title: str
+
+
+class SyllabusTopicInput(BaseModel):
+    subcat_id: int
+    unit: int = 1
+    topic: str
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -484,6 +855,7 @@ def user_payload(user: User) -> dict:
         "gender": user.gender,
         "class": user.class_field,
         "wallet_balance": user.wallet_balance or 0,
+        "role": getattr(user, "role", "student") or "student",
     }
 
 
@@ -853,6 +1225,12 @@ def delete_account(data: DeleteAccountInput, db: Annotated[Session, Depends(get_
     return {"success": "Account deleted successfully"}
 
 
+@app.get("/users")
+def get_users(db: Annotated[Session, Depends(get_db)] = None):
+    rows = db.query(User).order_by(User.id.desc()).all()
+    return [user_payload(row) for row in rows]
+
+
 @app.get("/categories")
 def get_categories(
     company_id: int = 1,
@@ -867,20 +1245,70 @@ def get_categories(
 
 @app.get("/subcategories")
 def get_subcategories(
-    class_level: Annotated[int, Query(alias="class")] = 1,
+    class_level: Annotated[Optional[int], Query(alias="class")] = None,
     category_id: int = 1,
+    semester: Optional[int] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
-    rows = (
-        db.query(SubCategory)
-        .filter(SubCategory.category_id == category_id, SubCategory.class_level == class_level)
-        .order_by(SubCategory.id)
-        .all()
-    )
+    query = db.query(SubCategory).filter(SubCategory.category_id == category_id)
+    if class_level is not None:
+        query = query.filter(SubCategory.class_level == class_level)
+    if semester is not None:
+        query = query.filter(SubCategory.semester == semester)
+    rows = query.order_by(SubCategory.semester, SubCategory.id).all()
     return {
         "status": "success",
-        "data": [{"id": row.id, "name": row.name} for row in rows],
+        "data": [
+            {
+                "id": row.id,
+                "name": row.name,
+                "class_level": row.class_level,
+                "semester": row.semester,
+            }
+            for row in rows
+        ],
     }
+
+
+@app.post("/subcategories")
+def create_subcategory(data: SubCategoryInput, db: Annotated[Session, Depends(get_db)]):
+    class_level = data.class_level
+    if class_level is None and data.semester:
+        class_level = (data.semester + 1) // 2
+    row = SubCategory(
+        category_id=data.category_id,
+        class_level=class_level,
+        semester=data.semester,
+        name=data.name,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id, "name": row.name, "class_level": row.class_level, "semester": row.semester}}
+
+
+@app.put("/subcategories/{subcat_id}")
+def update_subcategory(subcat_id: int, data: SubCategoryInput, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(SubCategory, subcat_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    row.name = data.name
+    row.category_id = data.category_id
+    row.semester = data.semester
+    row.class_level = data.class_level if data.class_level is not None else ((data.semester + 1) // 2 if data.semester else row.class_level)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id, "name": row.name, "class_level": row.class_level, "semester": row.semester}}
+
+
+@app.delete("/subcategories/{subcat_id}")
+def delete_subcategory(subcat_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(SubCategory, subcat_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Subject not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Subject deleted"}
 
 
 @app.get("/courses")
@@ -904,8 +1332,11 @@ def get_courses(db: Annotated[Session, Depends(get_db)] = None):
 
 
 @app.get("/books")
-def get_books(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
-    rows = db.query(Book).filter(Book.subcat_id == subcat_id).order_by(Book.id).all()
+def get_books(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(get_db)] = None):
+    query = db.query(Book)
+    if subcat_id is not None:
+        query = query.filter(Book.subcat_id == subcat_id)
+    rows = query.order_by(Book.id).all()
     return {
         "status": "success",
         "data": [
@@ -921,9 +1352,44 @@ def get_books(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
     }
 
 
+@app.post("/books")
+def create_book(data: BookInput, db: Annotated[Session, Depends(get_db)]):
+    row = Book(subcat_id=data.subcat_id, bookname=data.bookname, referencename=data.referencename, image=data.image)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.put("/books/{book_id}")
+def update_book(book_id: int, data: BookInput, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(Book, book_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Book not found")
+    row.subcat_id = data.subcat_id
+    row.bookname = data.bookname
+    row.referencename = data.referencename
+    row.image = data.image
+    db.commit()
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/books/{book_id}")
+def delete_book(book_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(Book, book_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Book not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Book deleted"}
+
+
 @app.get("/notes")
-def get_notes(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
-    rows = db.query(Note).filter(Note.subcat_id == subcat_id).order_by(Note.id).all()
+def get_notes(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(get_db)] = None):
+    query = db.query(Note)
+    if subcat_id is not None:
+        query = query.filter(Note.subcat_id == subcat_id)
+    rows = query.order_by(Note.id).all()
     return {
         "status": "success",
         "data": [
@@ -939,9 +1405,49 @@ def get_notes(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
     }
 
 
+@app.post("/notes")
+def create_note(data: NoteInput, db: Annotated[Session, Depends(get_db)]):
+    row = Note(
+        subcat_id=data.subcat_id,
+        chapter_num=data.chapter_num,
+        chapter_name=data.chapter_name,
+        image=data.image,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.put("/notes/{note_id}")
+def update_note(note_id: int, data: NoteInput, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(Note, note_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Note not found")
+    row.subcat_id = data.subcat_id
+    row.chapter_num = data.chapter_num
+    row.chapter_name = data.chapter_name
+    row.image = data.image
+    db.commit()
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/notes/{note_id}")
+def delete_note(note_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(Note, note_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Note not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Note deleted"}
+
+
 @app.get("/practicals")
-def get_practicals(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
-    rows = db.query(Practical).filter(Practical.subcat_id == subcat_id).order_by(Practical.id).all()
+def get_practicals(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(get_db)] = None):
+    query = db.query(Practical)
+    if subcat_id is not None:
+        query = query.filter(Practical.subcat_id == subcat_id)
+    rows = query.order_by(Practical.id).all()
     return {
         "status": "success",
         "data": [
@@ -957,9 +1463,49 @@ def get_practicals(subcat_id: int, db: Annotated[Session, Depends(get_db)] = Non
     }
 
 
+@app.post("/practicals")
+def create_practical(data: PracticalInput, db: Annotated[Session, Depends(get_db)]):
+    row = Practical(
+        subcat_id=data.subcat_id,
+        syllabus_title=data.syllabus_title,
+        syllabusPdf=data.syllabusPdf,
+        solutionPdf=data.solutionPdf,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.put("/practicals/{practical_id}")
+def update_practical(practical_id: int, data: PracticalInput, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(Practical, practical_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Practical not found")
+    row.subcat_id = data.subcat_id
+    row.syllabus_title = data.syllabus_title
+    row.syllabusPdf = data.syllabusPdf
+    row.solutionPdf = data.solutionPdf
+    db.commit()
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/practicals/{practical_id}")
+def delete_practical(practical_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(Practical, practical_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Practical not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Practical deleted"}
+
+
 @app.get("/question-papers")
-def get_question_papers(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
-    rows = db.query(QuestionPaper).filter(QuestionPaper.subcat_id == subcat_id).order_by(QuestionPaper.id).all()
+def get_question_papers(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(get_db)] = None):
+    query = db.query(QuestionPaper)
+    if subcat_id is not None:
+        query = query.filter(QuestionPaper.subcat_id == subcat_id)
+    rows = query.order_by(QuestionPaper.id).all()
     return [
         {
             "id": row.id,
@@ -972,9 +1518,44 @@ def get_question_papers(subcat_id: int, db: Annotated[Session, Depends(get_db)] 
     ]
 
 
+@app.post("/question-papers")
+def create_question_paper(data: QuestionPaperInput, db: Annotated[Session, Depends(get_db)]):
+    row = QuestionPaper(subcat_id=data.subcat_id, title=data.title, tag=data.tag, image=data.image)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.put("/question-papers/{paper_id}")
+def update_question_paper(paper_id: int, data: QuestionPaperInput, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(QuestionPaper, paper_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Question paper not found")
+    row.subcat_id = data.subcat_id
+    row.title = data.title
+    row.tag = data.tag
+    row.image = data.image
+    db.commit()
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/question-papers/{paper_id}")
+def delete_question_paper(paper_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(QuestionPaper, paper_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Question paper not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Question paper deleted"}
+
+
 @app.get("/question-bank")
-def get_question_bank(subcat_id: int, db: Annotated[Session, Depends(get_db)] = None):
-    rows = db.query(QuestionBankItem).filter(QuestionBankItem.subcat_id == subcat_id).order_by(QuestionBankItem.id).all()
+def get_question_bank(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(get_db)] = None):
+    query = db.query(QuestionBankItem)
+    if subcat_id is not None:
+        query = query.filter(QuestionBankItem.subcat_id == subcat_id)
+    rows = query.order_by(QuestionBankItem.id).all()
     return [
         {
             "id": row.id,
@@ -984,6 +1565,37 @@ def get_question_bank(subcat_id: int, db: Annotated[Session, Depends(get_db)] = 
         }
         for row in rows
     ]
+
+
+@app.post("/question-bank")
+def create_question_bank(data: QuestionBankInput, db: Annotated[Session, Depends(get_db)]):
+    row = QuestionBankItem(subcat_id=data.subcat_id, title=data.title, pdf=data.pdf)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.put("/question-bank/{item_id}")
+def update_question_bank(item_id: int, data: QuestionBankInput, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(QuestionBankItem, item_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Question bank item not found")
+    row.subcat_id = data.subcat_id
+    row.title = data.title
+    row.pdf = data.pdf
+    db.commit()
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/question-bank/{item_id}")
+def delete_question_bank(item_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(QuestionBankItem, item_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Question bank item not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Question bank item deleted"}
 
 
 @app.get("/videos")
@@ -1035,6 +1647,25 @@ def get_syllabus_topics(
     return result
 
 
+@app.post("/syllabus/topics")
+def create_syllabus_topic(data: SyllabusTopicInput, db: Annotated[Session, Depends(get_db)]):
+    row = SyllabusTopic(subcat_id=data.subcat_id, unit=data.unit, topic=data.topic)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/syllabus/topics/{topic_id}")
+def delete_syllabus_topic(topic_id: int, db: Annotated[Session, Depends(get_db)]):
+    row = db.get(SyllabusTopic, topic_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Syllabus topic not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Syllabus topic deleted"}
+
+
 @app.get("/syllabus/status")
 def set_syllabus_status(
     subcat_id: int,
@@ -1055,23 +1686,198 @@ def set_syllabus_status(
     return {"status": True, "message": "Status updated successfully"}
 
 
-@app.get("/news")
-def get_news(db: Annotated[Session, Depends(get_db)] = None):
-    rows = db.query(NewsItem).order_by(NewsItem.created_at.desc(), NewsItem.id.desc()).all()
-    return {
-        "status": "success",
-        "data": [
-            {
-                "id": row.id,
-                "title": row.title,
-                "description": row.description or "",
-                "image": row.image or "",
-                "author": row.author or "",
-                "Date": fmt_datetime(row.created_at),
-            }
-            for row in rows
-        ],
+NEWS_FEEDS = [
+    {"source": "The Hindu", "url": "https://www.thehindu.com/education/feeder/default.rss"},
+    {"source": "Hindustan Times", "url": "https://www.hindustantimes.com/feeds/rss/education/rssfeed.xml"},
+    {"source": "Livemint", "url": "https://www.livemint.com/rss/education"},
+    {"source": "Indian Express", "url": "https://indianexpress.com/section/education/feed/"},
+]
+
+NEWS_LIMIT = 30
+NEWS_CACHE_TTL_SECONDS = 600
+NEWS_IST = timezone(timedelta(hours=5, minutes=30))
+NEWS_ATOM_NS = "{http://www.w3.org/2005/Atom}"
+NEWS_MEDIA_NS = "{http://search.yahoo.com/mrss/}"
+NEWS_CONTENT_NS = "{http://purl.org/rss/1.0/modules/content/}"
+NEWS_DC_NS = "{http://purl.org/dc/elements/1.1/}"
+
+_news_cache: dict = {"fetched_at": 0.0, "items": []}
+
+
+def _clean_news_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", value)
+    text = unescape(text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _parse_news_date(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = value.strip()
+    try:
+        parsed = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, IndexError):
+        parsed = None
+    if parsed is None:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(NEWS_IST)
+
+
+def _first_news_text(item: ET.Element, tags: list) -> str:
+    for tag in tags:
+        node = item.find(tag)
+        if node is not None:
+            text = "".join(node.itertext()).strip()
+            if text:
+                return text
+    return ""
+
+
+def _extract_news_image(item: ET.Element, description_html: str) -> str:
+    for tag in (f"{NEWS_MEDIA_NS}content", f"{NEWS_MEDIA_NS}thumbnail"):
+        for node in item.findall(tag):
+            url = node.attrib.get("url")
+            if url:
+                return url
+
+    enclosure = item.find("enclosure")
+    if enclosure is not None:
+        url = enclosure.attrib.get("url", "")
+        is_image = enclosure.attrib.get("type", "").startswith("image")
+        if url and (is_image or re.search(r"\.(jpg|jpeg|png|webp|gif)(\?|$)", url, re.I)):
+            return url
+
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', description_html or "", re.I)
+    return match.group(1) if match else ""
+
+
+def _news_id(link: str, title: str) -> str:
+    seed = link or title
+    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def _parse_news_feed(source: str, payload: bytes) -> list:
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return []
+
+    entries = root.findall(".//item")
+    is_atom = False
+    if not entries:
+        entries = root.findall(f".//{NEWS_ATOM_NS}entry")
+        is_atom = True
+
+    items = []
+    for entry in entries:
+        if is_atom:
+            title = _first_news_text(entry, [f"{NEWS_ATOM_NS}title", "title"])
+            link = ""
+            for link_node in entry.findall(f"{NEWS_ATOM_NS}link"):
+                if link_node.attrib.get("rel", "alternate") == "alternate":
+                    link = link_node.attrib.get("href", "")
+                    break
+            raw_description = _first_news_text(entry, [f"{NEWS_ATOM_NS}summary", f"{NEWS_ATOM_NS}content", "description"])
+            raw_date = _first_news_text(entry, [f"{NEWS_ATOM_NS}published", f"{NEWS_ATOM_NS}updated", "pubDate"])
+            author = _first_news_text(entry, [f"{NEWS_ATOM_NS}author", f"{NEWS_DC_NS}creator", "author"])
+            category = _first_news_text(entry, [f"{NEWS_ATOM_NS}category", "category"])
+        else:
+            title = _first_news_text(entry, ["title"])
+            link = _first_news_text(entry, ["link"])
+            raw_description = _first_news_text(entry, ["description", f"{NEWS_CONTENT_NS}encoded"])
+            raw_date = _first_news_text(entry, ["pubDate", f"{NEWS_DC_NS}date"])
+            author = _first_news_text(entry, [f"{NEWS_DC_NS}creator", "author"])
+            category = _first_news_text(entry, ["category"])
+
+        title = _clean_news_text(title)
+        if not title:
+            continue
+
+        description = _clean_news_text(raw_description)
+        if len(description) > 600:
+            description = description[:597].rstrip() + "..."
+
+        parsed_date = _parse_news_date(raw_date)
+        image = _extract_news_image(entry, raw_description)
+
+        items.append({
+            "id": _news_id(link, title),
+            "title": title,
+            "description": description,
+            "image": image,
+            "author": _clean_news_text(author) or source,
+            "Date": parsed_date.strftime("%Y-%m-%d %H:%M:%S") if parsed_date else "",
+            "link": link,
+            "category": _clean_news_text(category) or "Education",
+            "source": source,
+            "_sort": parsed_date or datetime.min.replace(tzinfo=timezone.utc),
+        })
+
+    return items
+
+
+async def _fetch_news_feed(client: httpx.AsyncClient, feed: dict) -> list:
+    try:
+        response = await client.get(feed["url"])
+        response.raise_for_status()
+        return _parse_news_feed(feed["source"], response.content)
+    except Exception as exc:
+        print(f"News feed error ({feed['source']}): {exc}")
+        return []
+
+
+async def _fetch_all_news() -> list:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8",
     }
+    async with httpx.AsyncClient(timeout=15, follow_redirects=True, headers=headers) as client:
+        results = await asyncio.gather(*[_fetch_news_feed(client, feed) for feed in NEWS_FEEDS])
+
+    merged = []
+    seen_titles = set()
+    seen_links = set()
+    for feed_items in results:
+        for item in feed_items:
+            title_key = item["title"].lower()
+            link_key = item["link"].split("?")[0].lower() if item["link"] else ""
+            if title_key in seen_titles or (link_key and link_key in seen_links):
+                continue
+            seen_titles.add(title_key)
+            if link_key:
+                seen_links.add(link_key)
+            merged.append(item)
+
+    merged.sort(key=lambda x: x["_sort"], reverse=True)
+    for item in merged:
+        item.pop("_sort", None)
+    return merged[:NEWS_LIMIT]
+
+
+@app.get("/news")
+async def get_news(refresh: bool = False):
+    now = time.time()
+    cache_fresh = (now - _news_cache["fetched_at"]) < NEWS_CACHE_TTL_SECONDS
+    if cache_fresh and not refresh and _news_cache["items"]:
+        return {"status": "success", "data": _news_cache["items"], "cached": True}
+
+    items = await _fetch_all_news()
+    if items:
+        _news_cache["items"] = items
+        _news_cache["fetched_at"] = now
+        return {"status": "success", "data": items, "cached": False}
+
+    if _news_cache["items"]:
+        return {"status": "success", "data": _news_cache["items"], "cached": True, "stale": True}
+
+    return {"status": "success", "data": [], "cached": False, "message": "News feeds are not reachable right now."}
 
 
 @app.get("/project-categories")
@@ -1287,11 +2093,20 @@ def get_subjects(semester: int, db: Annotated[Session, Depends(get_db)] = None):
     class_level = (semester + 1) // 2
     rows = (
         db.query(SubCategory)
-        .filter(SubCategory.class_level == class_level)
+        .filter(
+            SubCategory.category_id == 1,
+            or_(
+                SubCategory.semester == semester,
+                and_(
+                    SubCategory.semester.is_(None),
+                    SubCategory.class_level == class_level,
+                ),
+            ),
+        )
         .order_by(SubCategory.id)
         .all()
     )
-    return [{"id": row.id, "name": row.name} for row in rows]
+    return [{"id": row.id, "name": row.name, "semester": row.semester} for row in rows]
 
 
 @app.post("/upload/notes")
@@ -1325,4 +2140,588 @@ def save_note_data(data: NoteUploadInput, db: Annotated[Session, Depends(get_db)
     return {"status": "success", "message": "Notes uploaded successfully"}
 
 
+async def _supabase_order_user(order_id: str) -> Optional[str]:
+    """Fallback: agar webhook metadata me user_id nahi hai to orders table se le lo."""
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY and order_id):
+        return None
+    try:
+        url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/orders"
+        headers = {
+            "apikey": SUPABASE_SERVICE_KEY,
+            "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        }
+        params = {"id": f"eq.{order_id}", "select": "user_id,metadata"}
+        async with httpx.AsyncClient(timeout=10) as client:
+            response = await client.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            return None
+        rows = response.json()
+        if not rows:
+            return None
+        row = rows[0]
+        if row.get("user_id"):
+            return str(row["user_id"])
+        metadata = row.get("metadata") or {}
+        if isinstance(metadata, dict) and metadata.get("user_id"):
+            return str(metadata["user_id"])
+    except Exception as exc:
+        print("Supabase order lookup failed:", exc)
+    return None
+
+
+@app.post("/api/youpi-webhook")
+async def youpi_webhook(request: Request):
+    raw_body = await request.body()
+    signature = request.headers.get("X-Gateway-Signature", "")
+    if not YOUPI_WEBHOOK_SECRET:
+        raise HTTPException(status_code=500, detail="Webhook secret not configured")
+    expected = "sha256=" + hmac.new(YOUPI_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = str(payload.get("event") or "").upper()
+    method = str(payload.get("method") or "UPI").upper()
+    order_id = payload.get("orderId")
+    payment_id = payload.get("paymentId")
+    utr = payload.get("utr")
+    metadata = payload.get("metadata") or {}
+
+    if event != "SUCCESS":
+        return {"received": True}
+
+    # COD / counter events me paisa receive nahi hua, wallet credit nahi karna.
+    if method and method != "UPI":
+        return {"received": True, "credited": False, "reason": "NON_UPI_METHOD"}
+
+    try:
+        amount_paise = int(float(payload.get("amountPaise") or 0))
+    except (TypeError, ValueError):
+        amount_paise = 0
+    amount = amount_paise / 100 if amount_paise else float(payload.get("amount") or 0)
+    reference = str(payment_id or order_id or "").strip()
+
+    if amount <= 0 or not reference:
+        return {"received": True, "credited": False, "reason": "INVALID_PAYLOAD"}
+
+    user_ref = None
+    if isinstance(metadata, dict):
+        user_ref = metadata.get("user_id")
+    if not user_ref and order_id:
+        user_ref = await _supabase_order_user(str(order_id))
+
+    credited = False
+    if user_ref:
+        db = SessionLocal()
+        try:
+            user = find_user(db, str(user_ref))
+            if user:
+                existing = (
+                    db.query(WalletTransaction)
+                    .filter(WalletTransaction.reference == reference)
+                    .first()
+                )
+                if existing:
+                    return {"received": True, "credited": False, "reason": "ALREADY_PROCESSED"}
+
+                user.wallet_balance = float(user.wallet_balance or 0) + amount
+                db.add(WalletTransaction(
+                    user_id=user.user_id or str(user.id),
+                    transaction_type="Credit",
+                    amount=amount,
+                    purchase=f"Wallet recharge {utr or order_id or ''}".strip(),
+                    status="Completed",
+                    reference=reference,
+                ))
+                db.add(RechargeTransaction(
+                    user_id=user.user_id or str(user.id),
+                    payer_name=user.name,
+                    amount=amount,
+                    transaction_id=str(order_id) if order_id else None,
+                    usertrant_id=str(utr) if utr else None,
+                    status="Success",
+                ))
+                db.commit()
+                credited = True
+        except Exception as exc:
+            db.rollback()
+            print("Wallet credit failed:", exc)
+            raise HTTPException(status_code=500, detail="Wallet credit failed")
+        finally:
+            db.close()
+
+    # Supabase orders table bhi sync rakho (agar configured hai)
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY and order_id:
+        try:
+            url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/orders"
+            headers = {
+                "apikey": SUPABASE_SERVICE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }
+            params = {"id": f"eq.{order_id}"}
+            data = {"status": "SUCCESS"}
+            if utr:
+                data["utr"] = str(utr)
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.patch(url, headers=headers, params=params, json=data)
+        except Exception as e:
+            print("Supabase update failed:", e)
+
+    return {"received": True, "credited": credited}
+
+
 app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# --- Smart College Learning App: New Endpoints ---
+
+class BookmarkInput(BaseModel):
+    user_id: str
+    material_id: int = None
+    pdf_id: int = None
+    book_id: int = None
+    title: str = None
+
+
+class PersonalNoteInput(BaseModel):
+    user_id: str
+    material_id: int = None
+    pdf_id: int = None
+    page_no: int = None
+    note_text: str
+
+
+class ReadingProgressInput(BaseModel):
+    user_id: str
+    material_id: int = None
+    pdf_id: int = None
+    book_id: int = None
+    current_page: int = 1
+    total_pages: int = None
+    progress_percent: float = 0
+
+
+class AIChatInput(BaseModel):
+    user_id: str = None
+    conversation_id: int = None
+    question: str
+    subject_id: int = None
+    pdf_id: int = None
+
+
+@app.get("/chapters")
+def get_chapters(subject_id: int, db: Session = Depends(get_db)):
+    rows = db.query(Chapter).filter(Chapter.subject_id == subject_id).order_by(Chapter.chapter_num, Chapter.id).all()
+    return [{"id": r.id, "subject_id": r.subject_id, "unit": r.unit, "chapter_name": r.chapter_name, "chapter_num": r.chapter_num} for r in rows]
+
+
+@app.get("/units")
+def get_units(subject_id: int, db: Session = Depends(get_db)):
+    rows = db.query(Unit).filter(Unit.subject_id == subject_id).order_by(Unit.unit_num).all()
+    return [{"id": r.id, "subject_id": r.subject_id, "unit_num": r.unit_num, "title": r.title} for r in rows]
+
+
+@app.post("/units")
+def create_unit(data: UnitInput, db: Session = Depends(get_db)):
+    row = Unit(subject_id=data.subject_id, unit_num=data.unit_num, title=data.title)
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.put("/units/{unit_id}")
+def update_unit(unit_id: int, data: UnitInput, db: Session = Depends(get_db)):
+    row = db.get(Unit, unit_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Unit not found")
+    row.subject_id = data.subject_id
+    row.unit_num = data.unit_num
+    row.title = data.title
+    db.commit()
+    return {"status": "success", "data": {"id": row.id}}
+
+
+@app.delete("/units/{unit_id}")
+def delete_unit(unit_id: int, db: Session = Depends(get_db)):
+    row = db.get(Unit, unit_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Unit not found")
+    db.delete(row)
+    db.commit()
+    return {"status": "success", "message": "Unit deleted"}
+
+
+@app.get("/study-materials")
+def get_study_materials(subject_id: int = None, chapter_id: int = None, unit_id: int = None, semester: int = None, db: Session = Depends(get_db)):
+    query = db.query(StudyMaterial)
+    if subject_id:
+        query = query.filter(StudyMaterial.subject_id == subject_id)
+    if chapter_id:
+        query = query.filter(StudyMaterial.chapter_id == chapter_id)
+    if unit_id:
+        query = query.filter(StudyMaterial.unit_id == unit_id)
+    if semester:
+        query = query.filter(StudyMaterial.semester == semester)
+    rows = query.order_by(StudyMaterial.id).all()
+    return [{"id": r.id, "subject_id": r.subject_id, "chapter_id": r.chapter_id, "unit_id": r.unit_id, "title": r.title, "material_type": r.material_type, "file_path": r.file_path, "semester": r.semester} for r in rows]
+
+
+@app.post("/bookmarks")
+def add_bookmark(data: BookmarkInput, db: Session = Depends(get_db)):
+    bookmark = Bookmark(user_id=data.user_id, material_id=data.material_id, pdf_id=data.pdf_id, book_id=data.book_id, title=data.title)
+    db.add(bookmark)
+    db.commit()
+    db.refresh(bookmark)
+    return {"status": "success", "id": bookmark.id}
+
+
+@app.get("/bookmarks")
+def get_bookmarks(user_id: str, db: Session = Depends(get_db)):
+    rows = db.query(Bookmark).filter(Bookmark.user_id == user_id).order_by(Bookmark.id.desc()).all()
+    return [{"id": r.id, "user_id": r.user_id, "material_id": r.material_id, "pdf_id": r.pdf_id, "book_id": r.book_id, "title": r.title, "created_at": fmt_datetime(r.created_at)} for r in rows]
+
+
+@app.post("/personal-notes")
+def add_personal_note(data: PersonalNoteInput, db: Session = Depends(get_db)):
+    note = PersonalNote(user_id=data.user_id, material_id=data.material_id, pdf_id=data.pdf_id, page_no=data.page_no, note_text=data.note_text)
+    db.add(note)
+    db.commit()
+    db.refresh(note)
+    return {"status": "success", "id": note.id}
+
+
+@app.get("/personal-notes")
+def get_personal_notes(user_id: str, pdf_id: int = None, db: Session = Depends(get_db)):
+    query = db.query(PersonalNote).filter(PersonalNote.user_id == user_id)
+    if pdf_id:
+        query = query.filter(PersonalNote.pdf_id == pdf_id)
+    rows = query.order_by(PersonalNote.id.desc()).all()
+    return [{"id": r.id, "user_id": r.user_id, "material_id": r.material_id, "pdf_id": r.pdf_id, "page_no": r.page_no, "note_text": r.note_text, "created_at": fmt_datetime(r.created_at), "updated_at": fmt_datetime(r.updated_at)} for r in rows]
+
+
+@app.post("/reading-progress")
+def update_reading_progress(data: ReadingProgressInput, db: Session = Depends(get_db)):
+    existing = db.query(ReadingProgress).filter(ReadingProgress.user_id == data.user_id, ReadingProgress.pdf_id == data.pdf_id).first()
+    if not existing and data.book_id:
+        existing = db.query(ReadingProgress).filter(ReadingProgress.user_id == data.user_id, ReadingProgress.book_id == data.book_id).first()
+    if existing:
+        existing.current_page = data.current_page
+        existing.total_pages = data.total_pages
+        existing.progress_percent = data.progress_percent
+        existing.last_read_at = datetime.utcnow()
+    else:
+        existing = ReadingProgress(user_id=data.user_id, material_id=data.material_id, pdf_id=data.pdf_id, book_id=data.book_id, current_page=data.current_page, total_pages=data.total_pages, progress_percent=data.progress_percent)
+        db.add(existing)
+    db.commit()
+    return {"status": "success"}
+
+
+@app.get("/reading-progress")
+def get_reading_progress(user_id: str, db: Session = Depends(get_db)):
+    rows = db.query(ReadingProgress).filter(ReadingProgress.user_id == user_id).order_by(ReadingProgress.last_read_at.desc()).all()
+    return [{"id": r.id, "user_id": r.user_id, "material_id": r.material_id, "pdf_id": r.pdf_id, "book_id": r.book_id, "current_page": r.current_page, "total_pages": r.total_pages, "progress_percent": r.progress_percent, "last_read_at": fmt_datetime(r.last_read_at)} for r in rows]
+
+
+@app.post("/ai/chat")
+def ai_chat(data: AIChatInput, db: Session = Depends(get_db)):
+    conversation = None
+    if data.conversation_id:
+        conversation = db.get(AIConversation, data.conversation_id)
+    if not conversation:
+        conversation = AIConversation(user_id=data.user_id, title=data.question[:60], subject_id=data.subject_id, pdf_id=data.pdf_id)
+        db.add(conversation)
+        db.commit()
+        db.refresh(conversation)
+    db.add(AIMessage(conversation_id=conversation.id, role="user", content=data.question))
+    db.commit()
+
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    openai_key = os.getenv("OPENAI_API_KEY")
+    groq_key = os.getenv("GROQ_API_KEY")
+
+    try:
+        if groq_key:
+            try:
+                payload = {"model": os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"), "messages": [{"role": "user", "content": data.question}], "temperature": 0.7}
+                headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
+                r = httpx.post("https://api.groq.com/openai/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                if r.status_code == 200:
+                    j = r.json()
+                    answer = j.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if answer:
+                        db.add(AIMessage(conversation_id=conversation.id, role="assistant", content=answer))
+                        db.commit()
+                        return {"status": "success", "answer": answer, "conversation_id": conversation.id}
+                print(r.status_code, r.text[:200])
+            except Exception as ex:
+                print(ex)
+        if gemini_key:
+            try:
+                payload = {"contents": [{"parts": [{"text": data.question}]}]}
+                model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+                r = httpx.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}", json=payload, timeout=60)
+                if r.status_code == 200:
+                    j = r.json()
+                    answer = j.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                    if answer:
+                        db.add(AIMessage(conversation_id=conversation.id, role="assistant", content=answer))
+                        db.commit()
+                        return {"status": "success", "answer": answer, "conversation_id": conversation.id}
+                print(r.status_code, r.text[:200])
+            except Exception as ex:
+                print(ex)
+        if openai_key:
+            try:
+                payload = {"model": os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), "messages": [{"role": "user", "content": data.question}], "temperature": 0.7}
+                headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+                r = httpx.post("https://api.openai.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                if r.status_code == 200:
+                    j = r.json()
+                    answer = j.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    if answer:
+                        db.add(AIMessage(conversation_id=conversation.id, role="assistant", content=answer))
+                        db.commit()
+                        return {"status": "success", "answer": answer, "conversation_id": conversation.id}
+            except Exception as ex:
+                print(ex)
+    except Exception as ex:
+        print(ex)
+
+    return {"status": "error", "configured": False, "message": "AI backend not configured. No fake responses are provided. Please integrate an AI provider in the backend.", "conversation_id": conversation.id}
+
+
+@app.get("/ai/conversations")
+def ai_conversations(user_id: str, db: Session = Depends(get_db)):
+    rows = db.query(AIConversation).filter(AIConversation.user_id == user_id).order_by(AIConversation.updated_at.desc()).all()
+    return [{"id": r.id, "user_id": r.user_id, "title": r.title, "subject_id": r.subject_id, "pdf_id": r.pdf_id, "created_at": fmt_datetime(r.created_at)} for r in rows]
+
+
+@app.get("/ai/messages")
+def ai_messages(conversation_id: int, db: Session = Depends(get_db)):
+    rows = db.query(AIMessage).filter(AIMessage.conversation_id == conversation_id).order_by(AIMessage.id).all()
+    return [{"id": r.id, "conversation_id": r.conversation_id, "role": r.role, "content": r.content, "sources": r.sources, "created_at": fmt_datetime(r.created_at)} for r in rows]
+
+
+@app.get("/exam-papers")
+def get_exam_papers_new(semester: int = None, subject_id: int = None, db: Session = Depends(get_db)):
+    query = db.query(ExamPaperNew)
+    if semester:
+        query = query.filter(ExamPaperNew.semester == semester)
+    if subject_id:
+        query = query.filter(ExamPaperNew.subject_id == subject_id)
+    rows = query.order_by(ExamPaperNew.id).all()
+    return [{"id": r.id, "semester": r.semester, "subject_id": r.subject_id, "title": r.title, "year": r.year, "file_path": r.file_path} for r in rows]
+
+
+@app.get("/important-questions")
+def get_important_questions(subject_id: int = None, chapter_id: int = None, db: Session = Depends(get_db)):
+    query = db.query(ImportantQuestion)
+    if subject_id:
+        query = query.filter(ImportantQuestion.subject_id == subject_id)
+    if chapter_id:
+        query = query.filter(ImportantQuestion.chapter_id == chapter_id)
+    rows = query.order_by(ImportantQuestion.id).all()
+    return [{"id": r.id, "subject_id": r.subject_id, "chapter_id": r.chapter_id, "question": r.question, "answer": r.answer, "explanation": r.explanation, "marks": r.marks, "question_type": r.question_type} for r in rows]
+
+
+@app.get("/mcqs")
+def get_mcqs(subject_id: int = None, chapter_id: int = None, db: Session = Depends(get_db)):
+    query = db.query(MCQ)
+    if subject_id:
+        query = query.filter(MCQ.subject_id == subject_id)
+    if chapter_id:
+        query = query.filter(MCQ.chapter_id == chapter_id)
+    rows = query.order_by(MCQ.id).all()
+    return [{"id": r.id, "subject_id": r.subject_id, "chapter_id": r.chapter_id, "question": r.question, "option_a": r.option_a, "option_b": r.option_b, "option_c": r.option_c, "option_d": r.option_d, "correct_option": r.correct_option, "explanation": r.explanation} for r in rows]
+
+
+@app.get("/mock-tests")
+def get_mock_tests(semester: int = None, subject_id: int = None, db: Session = Depends(get_db)):
+    query = db.query(MockTest)
+    if semester:
+        query = query.filter(MockTest.semester == semester)
+    if subject_id:
+        query = query.filter(MockTest.subject_id == subject_id)
+    rows = query.order_by(MockTest.id).all()
+    return [{"id": r.id, "title": r.title, "subject_id": r.subject_id, "semester": r.semester, "duration_minutes": r.duration_minutes, "total_marks": r.total_marks} for r in rows]
+
+
+@app.post("/mock-tests/start")
+def start_mock_test(data: dict, db: Session = Depends(get_db)):
+    mock_test_id = data.get("mock_test_id")
+    user_id = data.get("user_id")
+    attempt = TestAttempt(user_id=user_id, mock_test_id=mock_test_id, attempt_type="mock")
+    db.add(attempt)
+    db.commit()
+    db.refresh(attempt)
+    questions = db.query(MockTestQuestion).filter(MockTestQuestion.mock_test_id == mock_test_id).all()
+    return {"status": "success", "attempt_id": attempt.id, "questions": [{"id": q.id, "question": q.question, "option_a": q.option_a, "option_b": q.option_b, "option_c": q.option_c, "option_d": q.option_d, "marks": q.marks} for q in questions]}
+
+
+@app.post("/mock-tests/submit")
+def submit_mock_test(data: dict, db: Session = Depends(get_db)):
+    user_id = data.get("user_id")
+    mock_test_id = data.get("mock_test_id")
+    score = float(data.get("score", 0))
+    total = float(data.get("total", 0))
+    correct = int(data.get("correct", 0))
+    incorrect = int(data.get("incorrect", 0))
+    attempt = TestAttempt(user_id=user_id, mock_test_id=mock_test_id, attempt_type="mock", score=score, total=total, correct=correct, incorrect=incorrect, completed_at=datetime.utcnow())
+    db.add(attempt)
+    db.add(TestResult(user_id=user_id, test_name=data.get("test_name"), subject=data.get("subject"), score=score, total=total, percentage=round((score/total*100) if total else 0, 2)))
+    progress = db.query(StudentProgress).filter(StudentProgress.user_id == user_id).first()
+    if not progress:
+        progress = StudentProgress(user_id=user_id)
+        db.add(progress)
+    progress.total_tests = (progress.total_tests or 0) + 1
+    if progress.average_score:
+        progress.average_score = round((progress.average_score + (score/total*100 if total else 0)) / 2, 2)
+    else:
+        progress.average_score = round((score/total*100 if total else 0), 2)
+    progress.last_active = datetime.utcnow()
+    db.commit()
+    return {"status": "success", "message": "Test submitted successfully"}
+
+
+@app.get("/test-results")
+def get_test_results(user_id: str, db: Session = Depends(get_db)):
+    rows = db.query(TestResult).filter(TestResult.user_id == user_id).order_by(TestResult.id.desc()).all()
+    return [{"id": r.id, "user_id": r.user_id, "test_name": r.test_name, "subject": r.subject, "score": r.score, "total": r.total, "percentage": r.percentage, "created_at": fmt_datetime(r.created_at)} for r in rows]
+
+
+@app.get("/student-progress")
+def get_student_progress(user_id: str, db: Session = Depends(get_db)):
+    progress = db.query(StudentProgress).filter(StudentProgress.user_id == user_id).first()
+    if not progress:
+        return {"total_tests": 0, "average_score": 0, "pdf_read_count": 0, "bookmarked_questions": 0}
+    return {"total_tests": progress.total_tests or 0, "average_score": progress.average_score or 0, "pdf_read_count": progress.pdf_read_count or 0, "bookmarked_questions": 0}
+
+
+@app.get("/quiz-history")
+def get_quiz_history(user_id: str, db: Session = Depends(get_db)):
+    rows = db.query(TestResult).filter(TestResult.user_id == user_id).order_by(TestResult.id.desc()).limit(20).all()
+    return [{"id": r.id, "test_name": r.test_name, "subject": r.subject, "score": r.score, "total": r.total, "percentage": r.percentage, "created_at": fmt_datetime(r.created_at)} for r in rows]
+
+
+@app.get("/learning-activity")
+def get_learning_activity(user_id: str, db: Session = Depends(get_db)):
+    bookmarks = db.query(Bookmark).filter(Bookmark.user_id == user_id).count()
+    notes = db.query(PersonalNote).filter(PersonalNote.user_id == user_id).count()
+    reads = db.query(ReadingProgress).filter(ReadingProgress.user_id == user_id).count()
+    tests = db.query(TestAttempt).filter(TestAttempt.user_id == user_id).count()
+    return {"bookmarks": bookmarks, "personal_notes": notes, "reading_progress": reads, "tests_attempted": tests}
+
+
+def _active_user_ids_since(db: Session, since: datetime):
+    active = set()
+
+    def add_users(rows):
+        for row in rows:
+            value = row[0]
+            if value is not None and str(value).strip():
+                active.add(str(value))
+
+    add_users(db.query(DownloadEvent.user_id).filter(DownloadEvent.created_at >= since, DownloadEvent.user_id.isnot(None)).distinct().all())
+    add_users(db.query(ReadingProgress.user_id).filter(ReadingProgress.last_read_at >= since).distinct().all())
+    add_users(db.query(TestAttempt.user_id).filter(TestAttempt.started_at >= since).distinct().all())
+    add_users(db.query(Bookmark.user_id).filter(Bookmark.created_at >= since).distinct().all())
+    add_users(db.query(PersonalNote.user_id).filter(PersonalNote.updated_at >= since).distinct().all())
+    add_users(db.query(AIConversation.user_id).filter(AIConversation.updated_at >= since).distinct().all())
+    add_users(db.query(StudentProgress.user_id).filter(StudentProgress.last_active >= since).distinct().all())
+    return active
+
+
+@app.post("/downloads", status_code=201)
+def track_download(data: DownloadInput, db: Session = Depends(get_db)):
+    content_type = (data.content_type or "Unknown").strip()[:50] or "Unknown"
+    title = (data.title or "").strip()[:255] or None
+    user_id = (data.user_id or "").strip() or None
+
+    event = DownloadEvent(
+        user_id=user_id,
+        content_type=content_type,
+        content_id=data.content_id,
+        title=title,
+    )
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return {"status": "success", "message": "Download tracked", "id": event.id}
+
+
+@app.get("/admin/analytics")
+def admin_analytics(db: Session = Depends(get_db)):
+    now = datetime.utcnow()
+    today_start = datetime(now.year, now.month, now.day)
+    week_start = now - timedelta(days=7)
+    month_start = now - timedelta(days=30)
+
+    total_users = db.query(User).count()
+    total_downloads = db.query(DownloadEvent).count()
+    downloads_today = db.query(DownloadEvent).filter(DownloadEvent.created_at >= today_start).count()
+    downloads_week = db.query(DownloadEvent).filter(DownloadEvent.created_at >= week_start).count()
+    downloads_month = db.query(DownloadEvent).filter(DownloadEvent.created_at >= month_start).count()
+
+    type_rows = (
+        db.query(DownloadEvent.content_type, func.count(DownloadEvent.id))
+        .group_by(DownloadEvent.content_type)
+        .order_by(func.count(DownloadEvent.id).desc())
+        .all()
+    )
+    downloads_by_type = [
+        {"type": row[0] or "Unknown", "count": int(row[1] or 0)}
+        for row in type_rows
+    ]
+
+    recent_rows = (
+        db.query(DownloadEvent)
+        .order_by(DownloadEvent.created_at.desc(), DownloadEvent.id.desc())
+        .limit(10)
+        .all()
+    )
+    recent_downloads = [
+        {
+            "id": row.id,
+            "user_id": row.user_id,
+            "content_type": row.content_type,
+            "title": row.title,
+            "created_at": fmt_datetime(row.created_at),
+        }
+        for row in recent_rows
+    ]
+
+    return {
+        "total_users": total_users,
+        "total_downloads": total_downloads,
+        "downloads_today": downloads_today,
+        "downloads_week": downloads_week,
+        "downloads_month": downloads_month,
+        "active_users_today": len(_active_user_ids_since(db, today_start)),
+        "active_users_7d": len(_active_user_ids_since(db, week_start)),
+        "active_users_30d": len(_active_user_ids_since(db, month_start)),
+        "downloads_by_type": downloads_by_type,
+        "recent_downloads": recent_downloads,
+    }
+
+
+@app.get("/solutions")
+def get_solutions(subject_id: int = None, type: str = None, db: Session = Depends(get_db)):
+    results = []
+    if type in [None, "important"]:
+        q = db.query(ImportantQuestion)
+        if subject_id:
+            q = q.filter(ImportantQuestion.subject_id == subject_id)
+        for iq in q.all():
+            if iq.answer or iq.explanation:
+                results.append({"type": "important_question", "question": iq.question, "answer": iq.answer, "explanation": iq.explanation})
+    if type in [None, "mcq"]:
+        m = db.query(MCQ)
+        if subject_id:
+            m = m.filter(MCQ.subject_id == subject_id)
+        for mq in m.all():
+            results.append({"type": "mcq", "question": mq.question, "correct_option": mq.correct_option, "explanation": mq.explanation})
+    return results
