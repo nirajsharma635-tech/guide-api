@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import random
 import re
@@ -29,6 +30,13 @@ from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
 from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint, and_, create_engine, func, inspect, or_, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+
+try:
+    import boto3
+    from botocore.config import Config as BotoConfig
+except ImportError:  # object storage optional; local disk fallback rahega
+    boto3 = None
+    BotoConfig = None
 
 load_dotenv()
 
@@ -73,6 +81,60 @@ OTP_MAX_ATTEMPTS = 5
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# --- S3-compatible object storage (Backblaze B2 / Cloudflare R2 / any S3) ---
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID", "")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY") or os.getenv("R2_SECRET_ACCESS_KEY", "")
+S3_BUCKET = os.getenv("S3_BUCKET") or os.getenv("R2_BUCKET", "")
+S3_REGION = os.getenv("S3_REGION", "")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT") or os.getenv("R2_ENDPOINT", "")
+
+if not S3_ENDPOINT:
+    _r2_account_id = os.getenv("R2_ACCOUNT_ID", "")
+    if _r2_account_id:
+        S3_ENDPOINT = f"https://{_r2_account_id}.r2.cloudflarestorage.com"
+
+# R2 uses "auto"; Backblaze B2 ke liye region zaroori hai (e.g. us-west-004).
+if not S3_REGION:
+    S3_REGION = "auto"
+
+# B2 aur zyadatar S3 providers ke liye path-style addressing sabse reliable hai.
+S3_ADDRESSING_STYLE = os.getenv("S3_ADDRESSING_STYLE", "path")
+
+S3_ENABLED = bool(
+    boto3 and S3_ENDPOINT and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY and S3_BUCKET
+)
+S3_URL_TTL_SECONDS = int(
+    os.getenv("S3_URL_TTL_SECONDS") or os.getenv("R2_URL_TTL_SECONDS") or "900"
+)
+
+_s3_client = None
+
+
+def get_s3_client():
+    global _s3_client
+    if _s3_client is None:
+        config = BotoConfig(
+            signature_version="s3v4",
+            s3={"addressing_style": S3_ADDRESSING_STYLE},
+            retries={"max_attempts": 5, "mode": "standard"},
+        )
+        _s3_client = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+            region_name=S3_REGION,
+            config=config,
+        )
+    return _s3_client
+
+
+# Backwards-compatible aliases
+R2_ENABLED = S3_ENABLED
+R2_BUCKET = S3_BUCKET
+R2_URL_TTL_SECONDS = S3_URL_TTL_SECONDS
+get_r2_client = get_s3_client
 
 
 class Base(DeclarativeBase):
@@ -970,6 +1032,11 @@ def send_verification_email(recipient: str, code: str):
         server.send_message(message)
 
 
+def _guess_content_type(extension: str) -> str:
+    guessed, _ = mimetypes.guess_type("file" + extension)
+    return guessed or "application/octet-stream"
+
+
 def save_upload(upload: UploadFile, allowed_extensions: set) -> str:
     original = os.path.basename(upload.filename or "file")
     extension = os.path.splitext(original)[1].lower()
@@ -978,12 +1045,41 @@ def save_upload(upload: UploadFile, allowed_extensions: set) -> str:
 
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", original)
     filename = f"{int(datetime.now().timestamp() * 1000)}_{secrets.token_hex(4)}_{safe_name}"
-    destination = os.path.join(UPLOAD_DIR, filename)
 
+    if S3_ENABLED:
+        try:
+            upload.file.seek(0)
+            get_s3_client().upload_fileobj(
+                upload.file,
+                S3_BUCKET,
+                filename,
+                ExtraArgs={"ContentType": _guess_content_type(extension)},
+            )
+            return filename
+        except Exception as exc:
+            print(f"S3 upload failed, falling back to local disk: {exc}")
+
+    destination = os.path.join(UPLOAD_DIR, filename)
+    upload.file.seek(0)
     with open(destination, "wb") as output:
         shutil.copyfileobj(upload.file, output)
 
     return filename
+
+
+def build_media_url(key: str, expires: int = None) -> str:
+    """Return a temporary signed URL for a stored object key."""
+    if not key:
+        return ""
+    if re.match(r"^https?://", key, re.IGNORECASE):
+        return key
+    if S3_ENABLED:
+        return get_s3_client().generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": key.lstrip("/")},
+            ExpiresIn=expires or S3_URL_TTL_SECONDS,
+        )
+    return f"/uploads/{key.lstrip('/')}"
 
 
 @app.get("/")
@@ -2123,6 +2219,41 @@ def upload_image(
 ):
     filename = save_upload(file, {".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf"})
     return {"status": "success", "file": {"fileName": filename}}
+
+
+@app.get("/media/url")
+def media_url(
+    key: str = Query(..., description="Stored object key, e.g. 1712_ab12_notes.pdf"),
+    user_id: Optional[str] = Query(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    """Return a short-lived signed URL for a private R2 object.
+
+    A valid JWT (Authorization: Bearer <token>) ya valid user_id zaroori hai,
+    taaki sirf logged-in/paid users hi PDFs access kar sakein.
+    """
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    if re.match(r"^https?://", key, re.IGNORECASE):
+        return {"url": key, "expires_in": None}
+
+    authorized = False
+    if credentials is not None:
+        try:
+            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+            authorized = db.get(User, int(payload["sub"])) is not None
+        except (InvalidTokenError, ValueError, KeyError):
+            authorized = False
+
+    if not authorized and user_id:
+        authorized = db.query(User).filter(User.user_id == user_id).first() is not None
+
+    if not authorized:
+        raise HTTPException(status_code=401, detail="Login required")
+
+    return {"url": build_media_url(key), "expires_in": S3_URL_TTL_SECONDS}
 
 
 @app.post("/notes/upload")

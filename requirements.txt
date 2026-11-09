@@ -7,3 +7,4 @@ pyjwt
 email-validator
 psycopg[binary]
 python-multipart
+boto3
