@@ -2943,6 +2943,101 @@ def _gemini_translate_batch(texts: List[str], target_lang: str) -> Optional[List
         return None
 
 
+def _openai_compatible_translate_batch(
+    url: str, api_key: str, model: str, texts: List[str], language_name: str, provider: str
+) -> Optional[List[str]]:
+    """Translate via an OpenAI-compatible chat API (Groq, OpenAI)."""
+    system = (
+        f"You are a translation engine for a mobile study app. Translate every string in the user's "
+        f"JSON array into {language_name}. Keep the same order and length; keep brand/product names, "
+        f"emails, URLs, numbers and code unchanged; keep UI text short and natural; do not add "
+        f"explanations. Respond ONLY with a JSON object shaped like "
+        f'{{\"translations\": [\"...\"]}} containing the translated strings in order.'
+    )
+    try:
+        r = httpx.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": json.dumps(texts, ensure_ascii=False)},
+                ],
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print(f"{provider} translate error:", r.status_code)
+            return None
+        content = r.json().get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+        content = content.strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```[a-zA-Z]*\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+        parsed = json.loads(content)
+        items = parsed.get("translations") if isinstance(parsed, dict) else parsed
+        if not isinstance(items, list) or len(items) != len(texts):
+            print(f"{provider} translate malformed response")
+            return None
+        return [str(item) for item in items]
+    except Exception as exc:
+        print(f"{provider} translate failed:", exc)
+        return None
+
+
+def _groq_translate_batch(texts: List[str], target_lang: str) -> Optional[List[str]]:
+    language_name = SUPPORTED_LANGUAGES.get(target_lang)
+    api_key = os.getenv("GROQ_API_KEY")
+    if not language_name or not api_key:
+        return None
+    model = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    return _openai_compatible_translate_batch(
+        "https://api.groq.com/openai/v1/chat/completions", api_key, model, texts, language_name, "Groq"
+    )
+
+
+def _openai_translate_batch(texts: List[str], target_lang: str) -> Optional[List[str]]:
+    language_name = SUPPORTED_LANGUAGES.get(target_lang)
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not language_name or not api_key:
+        return None
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    return _openai_compatible_translate_batch(
+        "https://api.openai.com/v1/chat/completions", api_key, model, texts, language_name, "OpenAI"
+    )
+
+
+def _llm_translate_batch(texts: List[str], target_lang: str) -> Optional[List[str]]:
+    """Try each configured provider in order until one returns a valid translation."""
+    if not texts:
+        return []
+    if target_lang == "en":
+        return list(texts)
+    if target_lang not in SUPPORTED_LANGUAGES:
+        return None
+
+    providers = []
+    if os.getenv("GROQ_API_KEY"):
+        providers.append(_groq_translate_batch)
+    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"):
+        providers.append(_gemini_translate_batch)
+    if os.getenv("OPENAI_API_KEY"):
+        providers.append(_openai_translate_batch)
+
+    if not providers:
+        print("Translation skipped: no GROQ_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY configured.")
+        return None
+
+    for translator in providers:
+        result = translator(texts, target_lang)
+        if result:
+            return result
+    return None
+
+
 @app.post("/translate")
 def translate_texts(data: TranslateInput, db: Annotated[Session, Depends(get_db)]):
     target_lang = (data.target_lang or "").strip().lower()
@@ -2977,7 +3072,7 @@ def translate_texts(data: TranslateInput, db: Annotated[Session, Depends(get_db)
         for start in range(0, len(missing_hashes), 40):
             chunk_hashes = missing_hashes[start:start + 40]
             chunk_texts = [unique_missing[h] for h in chunk_hashes]
-            translated_chunk = _gemini_translate_batch(chunk_texts, target_lang)
+            translated_chunk = _llm_translate_batch(chunk_texts, target_lang)
             if not translated_chunk:
                 continue
             for source_hash, source_text, translated_text in zip(chunk_hashes, chunk_texts, translated_chunk):
