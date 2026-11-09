@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from html import unescape
-from typing import Annotated, Optional
+from typing import Annotated, List, Optional
 
 import jwt
 import httpx
@@ -566,6 +566,18 @@ class DownloadEvent(Base):
     content_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     title: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class TranslationCache(Base):
+    __tablename__ = "translation_cache"
+    __table_args__ = (UniqueConstraint("source_hash", "target_lang", name="uq_translation_source_lang"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_hash: Mapped[str] = mapped_column(String(64), index=True)
+    target_lang: Mapped[str] = mapped_column(String(10), index=True)
+    source_text: Mapped[str] = mapped_column(Text)
+    translated_text: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 Base.metadata.create_all(bind=engine)
@@ -2856,3 +2868,134 @@ def get_solutions(subject_id: int = None, type: str = None, db: Session = Depend
         for mq in m.all():
             results.append({"type": "mcq", "question": mq.question, "correct_option": mq.correct_option, "explanation": mq.explanation})
     return results
+
+
+# ---------------------------------------------------------------------------
+# UI translation (Gemini backed, DB cached)
+# ---------------------------------------------------------------------------
+
+SUPPORTED_LANGUAGES = {
+    "hi": "Hindi",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "ta": "Tamil",
+    "te": "Telugu",
+}
+
+
+class TranslateInput(BaseModel):
+    texts: List[str] = Field(default_factory=list)
+    target_lang: str
+
+
+def _translation_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _gemini_translate_batch(texts: List[str], target_lang: str) -> Optional[List[str]]:
+    """Translate a batch of strings using Gemini, returning a list in the same order."""
+    if not texts:
+        return []
+    if target_lang == "en":
+        return list(texts)
+    language_name = SUPPORTED_LANGUAGES.get(target_lang)
+    if not language_name:
+        return None
+
+    gemini_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if not gemini_key:
+        print("Translation skipped: GEMINI_API_KEY is not configured.")
+        return None
+
+    instruction = (
+        f"You are a translation engine for a mobile study app. Translate every string in the JSON array "
+        f"below into {language_name}. Rules: keep the same order and length; keep brand/product names, "
+        f"emails, URLs, numbers and code unchanged; keep UI text short and natural; do not add explanations. "
+        f"Return ONLY a valid JSON array of translated strings with no markdown fences."
+    )
+    model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+    try:
+        payload = {
+            "contents": [{"parts": [{"text": instruction + "\n\n" + json.dumps(texts, ensure_ascii=False)}]}],
+            "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
+        }
+        r = httpx.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}",
+            json=payload,
+            timeout=30,
+        )
+        if r.status_code != 200:
+            print("Gemini translate error:", r.status_code, r.text[:200])
+            return None
+        raw = r.json().get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        raw = (raw or "").strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```[a-zA-Z]*\s*", "", raw)
+            raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list) or len(parsed) != len(texts):
+            print("Gemini translate malformed response")
+            return None
+        return [str(item) for item in parsed]
+    except Exception as exc:
+        print("Gemini translate failed:", exc)
+        return None
+
+
+@app.post("/translate")
+def translate_texts(data: TranslateInput, db: Annotated[Session, Depends(get_db)]):
+    target_lang = (data.target_lang or "").strip().lower()
+    texts = list(data.texts or [])
+
+    if not texts:
+        return {"translations": [], "target_lang": target_lang}
+    if len(texts) > 100:
+        raise HTTPException(status_code=400, detail="Too many strings. Max 100 per request.")
+    if target_lang == "en":
+        return {"translations": texts, "target_lang": target_lang}
+    if target_lang not in SUPPORTED_LANGUAGES:
+        raise HTTPException(status_code=400, detail="Unsupported target language.")
+
+    cleaned = [str(t or "").strip()[:500] for t in texts]
+    hashes = [_translation_hash(t) for t in cleaned]
+
+    cached = {
+        row.source_hash: row.translated_text
+        for row in db.query(TranslationCache)
+        .filter(TranslationCache.target_lang == target_lang, TranslationCache.source_hash.in_(hashes))
+        .all()
+    }
+
+    unique_missing = {}
+    for text, source_hash in zip(cleaned, hashes):
+        if text and source_hash not in cached and source_hash not in unique_missing:
+            unique_missing[source_hash] = text
+
+    if unique_missing:
+        missing_hashes = list(unique_missing.keys())
+        for start in range(0, len(missing_hashes), 40):
+            chunk_hashes = missing_hashes[start:start + 40]
+            chunk_texts = [unique_missing[h] for h in chunk_hashes]
+            translated_chunk = _gemini_translate_batch(chunk_texts, target_lang)
+            if not translated_chunk:
+                continue
+            for source_hash, source_text, translated_text in zip(chunk_hashes, chunk_texts, translated_chunk):
+                translated_text = str(translated_text or "").strip()
+                if not translated_text:
+                    continue
+                db.add(TranslationCache(
+                    source_hash=source_hash,
+                    target_lang=target_lang,
+                    source_text=source_text,
+                    translated_text=translated_text,
+                ))
+                cached[source_hash] = translated_text
+        try:
+            db.commit()
+        except Exception as exc:
+            db.rollback()
+            print("Translation cache commit failed:", exc)
+
+    translations = [cached.get(source_hash, original) for original, source_hash in zip(cleaned, hashes)]
+    return {"translations": translations, "target_lang": target_lang}
