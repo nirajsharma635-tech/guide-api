@@ -4,7 +4,6 @@ import hmac
 import json
 import mimetypes
 import os
-import random
 import re
 import secrets
 import shutil
@@ -12,11 +11,14 @@ import smtplib
 import string
 import time
 import xml.etree.ElementTree as ET
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.utils import parsedate_to_datetime
 from html import unescape
+from threading import Lock
 from typing import Annotated, List, Optional
+from urllib.parse import urlsplit
 
 import jwt
 import httpx
@@ -41,16 +43,63 @@ except ImportError:  # object storage optional; local disk fallback rahega
 
 load_dotenv()
 
-app = FastAPI(title="Guide API", version="1.0.0")
+_IS_PROD = (
+    (os.getenv("ENVIRONMENT") or os.getenv("APP_ENV") or os.getenv("ENV") or "").strip().lower()
+    in {"prod", "production"}
+    or bool(os.getenv("RENDER"))
+)
+
+
+def allowed_origins() -> List[str]:
+    configured = [
+        origin.strip()
+        for origin in os.getenv("ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+    if configured:
+        return configured
+    return [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://localhost:8100",
+        "capacitor://localhost",
+        "ionic://localhost",
+    ]
+
+
+app = FastAPI(
+    title="Guide API",
+    version="1.0.0",
+    docs_url=None if _IS_PROD else "/docs",
+    redoc_url=None if _IS_PROD else "/redoc",
+    openapi_url=None if _IS_PROD else "/openapi.json",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:8100", "*"],
+    allow_origins=allowed_origins(),
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "X-Requested-With",
+        "X-API-KEY",
+        "X-Client-Key",
+    ],
+    expose_headers=["Content-Disposition"],
+    max_age=600,
 )
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    return response
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./college.db")
 
@@ -58,6 +107,15 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
 elif DATABASE_URL.startswith("postgresql://"):
     DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
+
+if (
+    DATABASE_URL.startswith("postgresql+psycopg://")
+    and "sslmode=" not in DATABASE_URL
+    and "localhost" not in DATABASE_URL
+    and "127.0.0.1" not in DATABASE_URL
+):
+    separator = "&" if "?" in DATABASE_URL else "?"
+    DATABASE_URL = f"{DATABASE_URL}{separator}sslmode=require"
 
 engine = create_engine(
     DATABASE_URL,
@@ -70,7 +128,19 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False)
 password_hash = PasswordHash.recommended()
 security = HTTPBearer()
 
-SECRET_KEY = os.getenv("SECRET_KEY", "local-dev-only-change-before-deployment")
+SECRET_KEY = (os.getenv("SECRET_KEY") or "").strip()
+if not SECRET_KEY:
+    if _IS_PROD:
+        raise RuntimeError("SECRET_KEY must be configured in production")
+    SECRET_KEY = "local-dev-only-change-before-deployment"
+    print("WARNING: SECRET_KEY is not set; using an insecure development key.")
+elif SECRET_KEY == "local-dev-only-change-before-deployment" and _IS_PROD:
+    raise RuntimeError("Refusing to start in production with the default SECRET_KEY")
+
+ACCESS_TOKEN_EXPIRE_MINUTES = int(
+    os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", str(7 * 24 * 60))
+)
+ADMIN_ROLES = {"admin", "superadmin"}
 
 YOUPI_WEBHOOK_SECRET = os.getenv("YOUPI_WEBHOOK_SECRET", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
@@ -82,6 +152,7 @@ OTP_MAX_ATTEMPTS = 5
 
 UPLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "25")) * 1024 * 1024
 
 # --- S3-compatible object storage (Backblaze B2 / Cloudflare R2 / any S3) ---
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID") or os.getenv("R2_ACCESS_KEY_ID", "")
@@ -607,6 +678,14 @@ def ensure_user_columns():
                     text(f'ALTER TABLE users ADD COLUMN "{column}" {ddl_type}')
                 )
 
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text('CREATE UNIQUE INDEX IF NOT EXISTS uq_users_user_id ON users("user_id")')
+            )
+    except Exception as exc:
+        print(f"Warning: could not enforce uniqueness on users.user_id (duplicate values?): {exc}")
+
 
 try:
     ensure_user_columns()
@@ -755,15 +834,36 @@ except Exception as exc:
     print(f"Warning: could not seed default content: {exc}")
 
 
+def warn_if_default_admin_password():
+    db = SessionLocal()
+    try:
+        admin = db.query(User).filter(User.email == "admin@guide.com").first()
+        if admin and password_hash.verify("admin123", admin.hashed_password):
+            print(
+                "SECURITY WARNING: admin@guide.com is still using the default password. "
+                "Change it immediately."
+            )
+    except Exception:
+        pass
+    finally:
+        db.close()
+
+
+try:
+    warn_if_default_admin_password()
+except Exception:
+    pass
+
+
 class RegisterInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
-    phone: Optional[str] = None
-    course: Optional[str] = None
-    gender: Optional[str] = None
-    class_field: Optional[str] = Field(default=None, alias="class")
-    user_id: Optional[str] = None
+    password: str = Field(min_length=8, max_length=128)
+    phone: Optional[str] = Field(default=None, max_length=20)
+    course: Optional[str] = Field(default=None, max_length=100)
+    gender: Optional[str] = Field(default=None, max_length=20)
+    class_field: Optional[str] = Field(default=None, alias="class", max_length=50)
+    user_id: Optional[str] = Field(default=None, min_length=4, max_length=50, pattern=r"^[A-Za-z0-9_-]+$")
     referral_code: Optional[str] = Field(default=None, alias="referralCode")
 
     class Config:
@@ -791,7 +891,8 @@ class ReferralInput(BaseModel):
 
 class ChangePasswordInput(BaseModel):
     email: EmailStr
-    new_password: str = Field(min_length=6, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+    old_password: Optional[str] = Field(default=None, min_length=1, max_length=128)
 
 
 class UpdateProfileInput(BaseModel):
@@ -911,9 +1012,16 @@ def normalize_email(email: str) -> str:
 
 
 def create_token(user: User):
-    expires = datetime.now(timezone.utc) + timedelta(hours=1)
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     return jwt.encode(
-        {"sub": str(user.id), "exp": expires},
+        {
+            "sub": str(user.id),
+            "role": getattr(user, "role", "student") or "student",
+            "iat": now,
+            "nbf": now,
+            "exp": expires,
+        },
         SECRET_KEY,
         algorithm="HS256",
     )
@@ -949,6 +1057,68 @@ def find_user(db: Session, user_ref: str) -> Optional[User]:
     return None
 
 
+def decode_access_token(token: str, db: Session) -> User:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
+        user_pk = int(payload.get("sub"))
+    except (InvalidTokenError, ValueError, TypeError, KeyError):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    user = db.get(User, user_pk)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+def get_current_user_optional(
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(HTTPBearer(auto_error=False))] = None,
+    db: Annotated[Session, Depends(get_db)] = None,
+) -> Optional[User]:
+    if credentials is None:
+        return None
+    return decode_access_token(credentials.credentials, db)
+
+
+def get_current_user(
+    current_user: Annotated[Optional[User], Depends(get_current_user_optional)],
+) -> User:
+    if current_user is None:
+        raise HTTPException(status_code=401, detail="Login required")
+    return current_user
+
+
+def require_admin(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    if (getattr(current_user, "role", None) or "student") not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return current_user
+
+
+def is_admin(user: User) -> bool:
+    return (getattr(user, "role", None) or "student") in ADMIN_ROLES
+
+
+def ensure_own_user(current_user: User, reference: Optional[str] = None) -> User:
+    """Client ke bheje user_id ko token wale user se match karta hai (IDOR se bachne ke liye)."""
+    if is_admin(current_user):
+        return current_user
+    if reference is None or not str(reference).strip():
+        return current_user
+
+    ref = str(reference).strip()
+    allowed = {str(current_user.id)}
+    if current_user.user_id:
+        allowed.add(str(current_user.user_id))
+    if ref not in allowed:
+        raise HTTPException(status_code=403, detail="You can only access your own data")
+    return current_user
+
+
+def user_ref(user: User) -> str:
+    return user.user_id or str(user.id)
+
+
 def fmt_datetime(value: Optional[datetime]) -> str:
     if not value:
         return ""
@@ -957,6 +1127,40 @@ def fmt_datetime(value: Optional[datetime]) -> str:
 
 def is_truthy(value: Optional[str]) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+_rate_lock = Lock()
+_rate_buckets: dict[str, deque] = defaultdict(deque)
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def check_rate_limit(
+    request: Request,
+    bucket: str,
+    limit: int,
+    window_seconds: int,
+    scope: str = "",
+) -> None:
+    key = f"{bucket}:{scope or client_ip(request)}"
+    now = time.monotonic()
+    with _rate_lock:
+        hits = _rate_buckets[key]
+        while hits and now - hits[0] > window_seconds:
+            hits.popleft()
+        if len(hits) >= limit:
+            retry_after = max(1, int(window_seconds - (now - hits[0])) + 1)
+            raise HTTPException(
+                status_code=429,
+                detail="Too many requests. Please try again later.",
+                headers={"Retry-After": str(retry_after)},
+            )
+        hits.append(now)
 
 
 def otp_hash(code: str) -> str:
@@ -1050,13 +1254,45 @@ def _guess_content_type(extension: str) -> str:
     return guessed or "application/octet-stream"
 
 
+_FILE_SIGNATURES = {
+    ".pdf": (b"%PDF-",),
+    ".jpg": (b"\xff\xd8\xff",),
+    ".jpeg": (b"\xff\xd8\xff",),
+    ".png": (b"\x89PNG\r\n\x1a\n",),
+    ".gif": (b"GIF87a", b"GIF89a"),
+    ".docx": (b"PK\x03\x04",),
+    ".doc": (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",),
+}
+
+
 def save_upload(upload: UploadFile, allowed_extensions: set) -> str:
     original = os.path.basename(upload.filename or "file")
     extension = os.path.splitext(original)[1].lower()
     if extension not in allowed_extensions:
         raise HTTPException(status_code=400, detail="This file type is not allowed")
 
-    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", original)
+    upload.file.seek(0, os.SEEK_END)
+    size = upload.file.tell()
+    upload.file.seek(0)
+    if size <= 0:
+        raise HTTPException(status_code=400, detail="Empty files are not allowed")
+    if size > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File is too large. Maximum allowed size is {MAX_UPLOAD_BYTES // (1024 * 1024)} MB",
+        )
+
+    header = upload.file.read(16)
+    upload.file.seek(0)
+    if extension == ".webp":
+        valid = len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP"
+    else:
+        signatures = _FILE_SIGNATURES.get(extension)
+        valid = True if not signatures else any(header.startswith(sig) for sig in signatures)
+    if not valid:
+        raise HTTPException(status_code=400, detail="File content does not match its extension")
+
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", original)[:80]
     filename = f"{int(datetime.now().timestamp() * 1000)}_{secrets.token_hex(4)}_{safe_name}"
 
     if S3_ENABLED:
@@ -1106,11 +1342,20 @@ def health():
 
 
 @app.post("/register", status_code=201)
-def register(data: RegisterInput, db: Annotated[Session, Depends(get_db)]):
+def register(
+    data: RegisterInput,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
+    check_rate_limit(request, "register", limit=10, window_seconds=3600)
     email = normalize_email(data.email)
 
     if db.query(User).filter(User.email == email).first():
         raise HTTPException(status_code=409, detail="Email already exists.")
+
+    new_user_id = (data.user_id or "").strip() or None
+    if new_user_id and db.query(User).filter(User.user_id == new_user_id).first():
+        raise HTTPException(status_code=409, detail="This user ID is already taken. Please try again.")
 
     otp_record = db.query(EmailOtp).filter(EmailOtp.email == email).first()
     if not otp_record or otp_record.verified_at is None:
@@ -1135,7 +1380,7 @@ def register(data: RegisterInput, db: Annotated[Session, Depends(get_db)]):
         course=data.course.strip() if data.course else None,
         gender=data.gender.strip() if data.gender else None,
         class_field=data.class_field.strip() if data.class_field else None,
-        user_id=data.user_id.strip() if data.user_id else None,
+        user_id=new_user_id,
         referred_by=referred_by,
         wallet_balance=0,
     )
@@ -1153,8 +1398,14 @@ def register(data: RegisterInput, db: Annotated[Session, Depends(get_db)]):
 
 
 @app.post("/login")
-def login(data: LoginInput, db: Annotated[Session, Depends(get_db)]):
+def login(
+    data: LoginInput,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
     email = normalize_email(data.email)
+    check_rate_limit(request, "login-ip", limit=20, window_seconds=300)
+    check_rate_limit(request, "login-email", limit=10, window_seconds=300, scope=email)
     user = db.query(User).filter(User.email == email).first()
 
     if not user or not password_hash.verify(data.password, user.hashed_password):
@@ -1165,36 +1416,48 @@ def login(data: LoginInput, db: Annotated[Session, Depends(get_db)]):
         "message": "Login successful",
         "access_token": create_token(user),
         "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         "user": user_payload(user),
     }
 
 
 @app.get("/me")
-def me(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
-    db: Annotated[Session, Depends(get_db)],
-):
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
-        user_id = int(payload["sub"])
-    except (InvalidTokenError, ValueError, KeyError):
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+def me(current_user: Annotated[User, Depends(get_current_user)]):
+    return user_payload(current_user)
 
-    user = db.get(User, user_id)
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found")
 
-    return user_payload(user)
+@app.post("/refresh")
+def refresh(current_user: Annotated[User, Depends(get_current_user)]):
+    return {
+        "status": "success",
+        "access_token": create_token(current_user),
+        "token_type": "bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        "user": user_payload(current_user),
+    }
 
 
 @app.post("/otp/send")
-def send_otp(data: OtpSendInput, db: Annotated[Session, Depends(get_db)] = None):
+def send_otp(
+    data: OtpSendInput,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)] = None,
+):
     email = normalize_email(data.email)
-    code = "".join(random.choices(string.digits, k=5))
+    check_rate_limit(request, "otp-send-ip", limit=10, window_seconds=600)
+    check_rate_limit(request, "otp-send-email", limit=5, window_seconds=600, scope=email)
+
+    code = "".join(secrets.choice(string.digits) for _ in range(5))
     now = datetime.utcnow()
     expires_at = now + timedelta(minutes=OTP_TTL_MINUTES)
 
     record = db.query(EmailOtp).filter(EmailOtp.email == email).first()
+    if record and record.created_at and (now - record.created_at).total_seconds() < 60:
+        raise HTTPException(
+            status_code=429,
+            detail="Please wait a minute before requesting another OTP.",
+            headers={"Retry-After": "60"},
+        )
     if record:
         record.otp_hash = otp_hash(code)
         record.attempts = 0
@@ -1212,7 +1475,13 @@ def send_otp(data: OtpSendInput, db: Annotated[Session, Depends(get_db)] = None)
         os.getenv("SMTP_HOST", "").strip()
         and (os.getenv("SMTP_FROM", "").strip() or os.getenv("SMTP_USER", "").strip())
     )
-    dev_mode = is_truthy(os.getenv("OTP_DEV_MODE", "false")) or not smtp_configured
+    dev_mode = is_truthy(os.getenv("OTP_DEV_MODE", "false"))
+    if not smtp_configured and not dev_mode:
+        db.rollback()
+        raise HTTPException(
+            status_code=503,
+            detail="Email service is not configured. Please contact support.",
+        )
     try:
         send_verification_email(email, code)
     except Exception as exc:
@@ -1220,10 +1489,10 @@ def send_otp(data: OtpSendInput, db: Annotated[Session, Depends(get_db)] = None)
             print(f"[DEV OTP] {email} -> {code} ({exc})")
         else:
             db.rollback()
-            return {
-                "status": "error",
-                "message": "Verification email could not be sent. Please try again later.",
-            }
+            raise HTTPException(
+                status_code=502,
+                detail="Verification email could not be sent. Please try again later.",
+            )
 
     db.commit()
 
@@ -1239,8 +1508,14 @@ def send_otp(data: OtpSendInput, db: Annotated[Session, Depends(get_db)] = None)
 
 
 @app.post("/otp/verify")
-def verify_otp(data: OtpVerifyInput, db: Annotated[Session, Depends(get_db)] = None):
+def verify_otp(
+    data: OtpVerifyInput,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)] = None,
+):
     email = normalize_email(data.email)
+    check_rate_limit(request, "otp-verify-ip", limit=20, window_seconds=600)
+    check_rate_limit(request, "otp-verify-email", limit=10, window_seconds=600, scope=email)
     record = db.query(EmailOtp).filter(EmailOtp.email == email).first()
 
     if not record:
@@ -1283,12 +1558,22 @@ def check_referral(data: ReferralInput, db: Annotated[Session, Depends(get_db)])
 
 
 @app.post("/change-password")
-def change_password(data: ChangePasswordInput, db: Annotated[Session, Depends(get_db)]):
+def change_password(
+    data: ChangePasswordInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
     email = normalize_email(data.email)
-    user = db.query(User).filter(User.email == email).first()
 
+    if email != normalize_email(current_user.email) and not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="You can only change your own password")
+
+    user = db.query(User).filter(User.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Email is not registered")
+
+    if not data.old_password or not password_hash.verify(data.old_password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Old password is incorrect")
 
     user.hashed_password = password_hash.hash(data.new_password)
     db.commit()
@@ -1297,7 +1582,12 @@ def change_password(data: ChangePasswordInput, db: Annotated[Session, Depends(ge
 
 
 @app.post("/update-profile")
-def update_profile(data: UpdateProfileInput, db: Annotated[Session, Depends(get_db)]):
+def update_profile(
+    data: UpdateProfileInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    ensure_own_user(current_user, data.user_id)
     user = find_user(db, data.user_id)
 
     if not user:
@@ -1322,7 +1612,12 @@ def update_profile(data: UpdateProfileInput, db: Annotated[Session, Depends(get_
 
 
 @app.post("/delete-account")
-def delete_account(data: DeleteAccountInput, db: Annotated[Session, Depends(get_db)]):
+def delete_account(
+    data: DeleteAccountInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
+    ensure_own_user(current_user, data.user_id)
     user = find_user(db, data.user_id)
 
     if not user:
@@ -1335,7 +1630,10 @@ def delete_account(data: DeleteAccountInput, db: Annotated[Session, Depends(get_
 
 
 @app.get("/users")
-def get_users(db: Annotated[Session, Depends(get_db)] = None):
+def get_users(
+    admin: Annotated[User, Depends(require_admin)],
+    db: Annotated[Session, Depends(get_db)] = None,
+):
     rows = db.query(User).order_by(User.id.desc()).all()
     return [user_payload(row) for row in rows]
 
@@ -1380,7 +1678,7 @@ def get_subcategories(
 
 
 @app.post("/subcategories")
-def create_subcategory(data: SubCategoryInput, db: Annotated[Session, Depends(get_db)]):
+def create_subcategory(data: SubCategoryInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     class_level = data.class_level
     if class_level is None and data.semester:
         class_level = (data.semester + 1) // 2
@@ -1397,7 +1695,7 @@ def create_subcategory(data: SubCategoryInput, db: Annotated[Session, Depends(ge
 
 
 @app.put("/subcategories/{subcat_id}")
-def update_subcategory(subcat_id: int, data: SubCategoryInput, db: Annotated[Session, Depends(get_db)]):
+def update_subcategory(subcat_id: int, data: SubCategoryInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(SubCategory, subcat_id)
     if not row:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -1411,7 +1709,7 @@ def update_subcategory(subcat_id: int, data: SubCategoryInput, db: Annotated[Ses
 
 
 @app.delete("/subcategories/{subcat_id}")
-def delete_subcategory(subcat_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_subcategory(subcat_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(SubCategory, subcat_id)
     if not row:
         raise HTTPException(status_code=404, detail="Subject not found")
@@ -1462,7 +1760,7 @@ def get_books(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(ge
 
 
 @app.post("/books")
-def create_book(data: BookInput, db: Annotated[Session, Depends(get_db)]):
+def create_book(data: BookInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = Book(subcat_id=data.subcat_id, bookname=data.bookname, referencename=data.referencename, image=data.image)
     db.add(row)
     db.commit()
@@ -1471,7 +1769,7 @@ def create_book(data: BookInput, db: Annotated[Session, Depends(get_db)]):
 
 
 @app.put("/books/{book_id}")
-def update_book(book_id: int, data: BookInput, db: Annotated[Session, Depends(get_db)]):
+def update_book(book_id: int, data: BookInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(Book, book_id)
     if not row:
         raise HTTPException(status_code=404, detail="Book not found")
@@ -1484,7 +1782,7 @@ def update_book(book_id: int, data: BookInput, db: Annotated[Session, Depends(ge
 
 
 @app.delete("/books/{book_id}")
-def delete_book(book_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_book(book_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(Book, book_id)
     if not row:
         raise HTTPException(status_code=404, detail="Book not found")
@@ -1515,7 +1813,7 @@ def get_notes(subcat_id: Optional[int] = None, db: Annotated[Session, Depends(ge
 
 
 @app.post("/notes")
-def create_note(data: NoteInput, db: Annotated[Session, Depends(get_db)]):
+def create_note(data: NoteInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = Note(
         subcat_id=data.subcat_id,
         chapter_num=data.chapter_num,
@@ -1529,7 +1827,7 @@ def create_note(data: NoteInput, db: Annotated[Session, Depends(get_db)]):
 
 
 @app.put("/notes/{note_id}")
-def update_note(note_id: int, data: NoteInput, db: Annotated[Session, Depends(get_db)]):
+def update_note(note_id: int, data: NoteInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(Note, note_id)
     if not row:
         raise HTTPException(status_code=404, detail="Note not found")
@@ -1542,7 +1840,7 @@ def update_note(note_id: int, data: NoteInput, db: Annotated[Session, Depends(ge
 
 
 @app.delete("/notes/{note_id}")
-def delete_note(note_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_note(note_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(Note, note_id)
     if not row:
         raise HTTPException(status_code=404, detail="Note not found")
@@ -1573,7 +1871,7 @@ def get_practicals(subcat_id: Optional[int] = None, db: Annotated[Session, Depen
 
 
 @app.post("/practicals")
-def create_practical(data: PracticalInput, db: Annotated[Session, Depends(get_db)]):
+def create_practical(data: PracticalInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = Practical(
         subcat_id=data.subcat_id,
         syllabus_title=data.syllabus_title,
@@ -1587,7 +1885,7 @@ def create_practical(data: PracticalInput, db: Annotated[Session, Depends(get_db
 
 
 @app.put("/practicals/{practical_id}")
-def update_practical(practical_id: int, data: PracticalInput, db: Annotated[Session, Depends(get_db)]):
+def update_practical(practical_id: int, data: PracticalInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(Practical, practical_id)
     if not row:
         raise HTTPException(status_code=404, detail="Practical not found")
@@ -1600,7 +1898,7 @@ def update_practical(practical_id: int, data: PracticalInput, db: Annotated[Sess
 
 
 @app.delete("/practicals/{practical_id}")
-def delete_practical(practical_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_practical(practical_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(Practical, practical_id)
     if not row:
         raise HTTPException(status_code=404, detail="Practical not found")
@@ -1628,7 +1926,7 @@ def get_question_papers(subcat_id: Optional[int] = None, db: Annotated[Session, 
 
 
 @app.post("/question-papers")
-def create_question_paper(data: QuestionPaperInput, db: Annotated[Session, Depends(get_db)]):
+def create_question_paper(data: QuestionPaperInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = QuestionPaper(subcat_id=data.subcat_id, title=data.title, tag=data.tag, image=data.image)
     db.add(row)
     db.commit()
@@ -1637,7 +1935,7 @@ def create_question_paper(data: QuestionPaperInput, db: Annotated[Session, Depen
 
 
 @app.put("/question-papers/{paper_id}")
-def update_question_paper(paper_id: int, data: QuestionPaperInput, db: Annotated[Session, Depends(get_db)]):
+def update_question_paper(paper_id: int, data: QuestionPaperInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(QuestionPaper, paper_id)
     if not row:
         raise HTTPException(status_code=404, detail="Question paper not found")
@@ -1650,7 +1948,7 @@ def update_question_paper(paper_id: int, data: QuestionPaperInput, db: Annotated
 
 
 @app.delete("/question-papers/{paper_id}")
-def delete_question_paper(paper_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_question_paper(paper_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(QuestionPaper, paper_id)
     if not row:
         raise HTTPException(status_code=404, detail="Question paper not found")
@@ -1677,7 +1975,7 @@ def get_question_bank(subcat_id: Optional[int] = None, db: Annotated[Session, De
 
 
 @app.post("/question-bank")
-def create_question_bank(data: QuestionBankInput, db: Annotated[Session, Depends(get_db)]):
+def create_question_bank(data: QuestionBankInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = QuestionBankItem(subcat_id=data.subcat_id, title=data.title, pdf=data.pdf)
     db.add(row)
     db.commit()
@@ -1686,7 +1984,7 @@ def create_question_bank(data: QuestionBankInput, db: Annotated[Session, Depends
 
 
 @app.put("/question-bank/{item_id}")
-def update_question_bank(item_id: int, data: QuestionBankInput, db: Annotated[Session, Depends(get_db)]):
+def update_question_bank(item_id: int, data: QuestionBankInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(QuestionBankItem, item_id)
     if not row:
         raise HTTPException(status_code=404, detail="Question bank item not found")
@@ -1698,7 +1996,7 @@ def update_question_bank(item_id: int, data: QuestionBankInput, db: Annotated[Se
 
 
 @app.delete("/question-bank/{item_id}")
-def delete_question_bank(item_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_question_bank(item_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(QuestionBankItem, item_id)
     if not row:
         raise HTTPException(status_code=404, detail="Question bank item not found")
@@ -1730,9 +2028,15 @@ def get_videos(
 @app.get("/syllabus/topics")
 def get_syllabus_topics(
     subcat_id: int,
+    current_user: Annotated[Optional[User], Depends(get_current_user_optional)] = None,
     user_id: Optional[str] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
+    if user_id:
+        if current_user is None:
+            raise HTTPException(status_code=401, detail="Login required")
+        ensure_own_user(current_user, user_id)
+
     topics = db.query(SyllabusTopic).filter(SyllabusTopic.subcat_id == subcat_id).order_by(SyllabusTopic.unit, SyllabusTopic.id).all()
 
     status_map = {}
@@ -1757,7 +2061,7 @@ def get_syllabus_topics(
 
 
 @app.post("/syllabus/topics")
-def create_syllabus_topic(data: SyllabusTopicInput, db: Annotated[Session, Depends(get_db)]):
+def create_syllabus_topic(data: SyllabusTopicInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = SyllabusTopic(subcat_id=data.subcat_id, unit=data.unit, topic=data.topic)
     db.add(row)
     db.commit()
@@ -1766,7 +2070,7 @@ def create_syllabus_topic(data: SyllabusTopicInput, db: Annotated[Session, Depen
 
 
 @app.delete("/syllabus/topics/{topic_id}")
-def delete_syllabus_topic(topic_id: int, db: Annotated[Session, Depends(get_db)]):
+def delete_syllabus_topic(topic_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(SyllabusTopic, topic_id)
     if not row:
         raise HTTPException(status_code=404, detail="Syllabus topic not found")
@@ -1780,8 +2084,10 @@ def set_syllabus_status(
     subcat_id: int,
     status: str,
     user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
     db: Annotated[Session, Depends(get_db)] = None,
 ):
+    ensure_own_user(current_user, user_id)
     record = (
         db.query(SyllabusStatus)
         .filter(SyllabusStatus.user_id == user_id, SyllabusStatus.topic_id == subcat_id)
@@ -2045,17 +2351,25 @@ def get_forum_questions(db: Annotated[Session, Depends(get_db)] = None):
 
 
 @app.post("/forum/questions")
-def post_forum_question(data: ForumQuestionInput, db: Annotated[Session, Depends(get_db)]):
+def post_forum_question(
+    data: ForumQuestionInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
     if not data.text.strip():
         return {"success": False, "error": "Question cannot be empty"}
 
-    db.add(ForumQuestion(user_id=data.user_id, name=data.name, text=data.text.strip()))
+    db.add(ForumQuestion(user_id=user_ref(current_user), name=current_user.name or data.name, text=data.text.strip()))
     db.commit()
     return {"success": True, "message": "Question posted successfully"}
 
 
 @app.post("/forum/replies")
-def post_forum_reply(data: ForumReplyInput, db: Annotated[Session, Depends(get_db)]):
+def post_forum_reply(
+    data: ForumReplyInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+):
     question = db.get(ForumQuestion, data.question_id)
     if not question:
         return {"success": False, "error": "Question not found"}
@@ -2069,8 +2383,13 @@ def post_forum_reply(data: ForumReplyInput, db: Annotated[Session, Depends(get_d
 
 
 @app.get("/wallet")
-def get_wallet(user_id: str, db: Annotated[Session, Depends(get_db)] = None):
-    user = find_user(db, user_id)
+def get_wallet(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    ensure_own_user(current_user, user_id)
+    user = current_user
     if not user:
         return {"balance": 0, "error": "User not found"}
     return {"balance": user.wallet_balance or 0}
@@ -2079,13 +2398,18 @@ def get_wallet(user_id: str, db: Annotated[Session, Depends(get_db)] = None):
 @app.post("/wallet")
 def update_wallet(
     data: WalletTransactionInput,
+    current_user: Annotated[User, Depends(get_current_user)],
     user_id: Optional[str] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
     reference = (data.user_id or user_id or "").strip()
-    user = find_user(db, reference)
+    ensure_own_user(current_user, reference)
+    user = current_user
     if not user:
         return {"error": "User not found"}
+
+    if data.transaction_type.lower() != "debit" and not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Only admin can credit wallet")
 
     amount = float(data.amount or 0)
     if amount <= 0:
@@ -2113,7 +2437,12 @@ def update_wallet(
 
 
 @app.get("/wallet/recharges")
-def get_recharges(user_id: str, db: Annotated[Session, Depends(get_db)] = None):
+def get_recharges(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    ensure_own_user(current_user, user_id)
     rows = (
         db.query(RechargeTransaction)
         .filter(RechargeTransaction.user_id == user_id)
@@ -2138,9 +2467,11 @@ def get_recharges(user_id: str, db: Annotated[Session, Depends(get_db)] = None):
 @app.get("/wallet/transactions")
 def get_wallet_transactions(
     user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
     transactions: bool = True,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
+    ensure_own_user(current_user, user_id)
     rows = (
         db.query(WalletTransaction)
         .filter(WalletTransaction.user_id == user_id)
@@ -2168,18 +2499,24 @@ def get_wallet_transactions(
 @app.post("/wallet/recharge")
 def store_recharge(
     data: RechargeInput,
+    current_user: Annotated[User, Depends(get_current_user)],
     user_id: Optional[str] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
     reference = (data.user_id or user_id or "").strip()
-    user = find_user(db, reference)
+    ensure_own_user(current_user, reference)
+    user = current_user
     if not user:
         return {"success": False, "message": "User not found"}
+
+    amount = float(data.amount or 0)
+    if not (1 <= amount <= 1_000_000):
+        raise HTTPException(status_code=400, detail="Invalid recharge amount")
 
     db.add(RechargeTransaction(
         user_id=user.user_id or str(user.id),
         payer_name=data.payer_name,
-        amount=float(data.amount or 0),
+        amount=amount,
         transaction_id=data.transaction_id,
         usertrant_id=data.usertrant_id,
         status="Pending",
@@ -2221,6 +2558,7 @@ def get_subjects(semester: int, db: Annotated[Session, Depends(get_db)] = None):
 @app.post("/upload/notes")
 def upload_notes_file(
     file: Annotated[UploadFile, File(alias="myFile")],
+    current_user: Annotated[User, Depends(get_current_user)],
 ):
     filename = save_upload(file, {".pdf", ".doc", ".docx", ".jpg", ".jpeg", ".png"})
     return {"status": "success", "file_name": filename}
@@ -2229,6 +2567,7 @@ def upload_notes_file(
 @app.post("/upload/image")
 def upload_image(
     file: Annotated[UploadFile, File()],
+    current_user: Annotated[User, Depends(get_current_user)],
 ):
     filename = save_upload(file, {".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf"})
     return {"status": "success", "file": {"fileName": filename}}
@@ -2237,34 +2576,15 @@ def upload_image(
 @app.get("/media/url")
 def media_url(
     key: str = Query(..., description="Stored object key, e.g. 1712_ab12_notes.pdf"),
-    user_id: Optional[str] = Query(None),
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
-    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None,
 ):
     """Return a short-lived signed URL for a private R2 object.
 
-    A valid JWT (Authorization: Bearer <token>) ya valid user_id zaroori hai,
-    taaki sirf logged-in/paid users hi PDFs access kar sakein.
+    Sirf valid JWT (Authorization: Bearer <token>) wale logged-in users hi
+    PDFs access kar sakte hain.
     """
     if not key:
         raise HTTPException(status_code=400, detail="key is required")
-
-    if re.match(r"^https?://", key, re.IGNORECASE):
-        return {"url": key, "expires_in": None}
-
-    authorized = False
-    if credentials is not None:
-        try:
-            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
-            authorized = db.get(User, int(payload["sub"])) is not None
-        except (InvalidTokenError, ValueError, KeyError):
-            authorized = False
-
-    if not authorized and user_id:
-        authorized = db.query(User).filter(User.user_id == user_id).first() is not None
-
-    if not authorized:
-        raise HTTPException(status_code=401, detail="Login required")
 
     return {"url": build_media_url(key), "expires_in": S3_URL_TTL_SECONDS}
 
@@ -2273,33 +2593,26 @@ def media_url(
 def media_file(
     key: str = Query(..., description="Stored object key, e.g. 1712_ab12_notes.pdf"),
     download: bool = Query(False),
-    user_id: Optional[str] = Query(None),
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
-    db: Annotated[Session, Depends(get_db)] = None,
+    current_user: Annotated[User, Depends(get_current_user)] = None,
 ):
     """Stream a stored PDF through the API (avoids browser CORS issues).
 
-    Same login/paid-user check as /media/url.
+    Same login check as /media/url.
     """
     if not key:
         raise HTTPException(status_code=400, detail="key is required")
 
-    authorized = False
-    if credentials is not None:
-        try:
-            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
-            authorized = db.get(User, int(payload["sub"])) is not None
-        except (InvalidTokenError, ValueError, KeyError):
-            authorized = False
-
-    if not authorized and user_id:
-        authorized = db.query(User).filter(User.user_id == user_id).first() is not None
-
-    if not authorized:
-        raise HTTPException(status_code=401, detail="Login required")
-
     if re.match(r"^https?://", key, re.IGNORECASE):
-        return RedirectResponse(key)
+        host = (urlsplit(key).hostname or "").lower()
+        allowed_hosts = set()
+        for configured in (S3_ENDPOINT, SUPABASE_URL):
+            if configured:
+                configured_host = (urlsplit(configured).hostname or "").lower()
+                if configured_host:
+                    allowed_hosts.add(configured_host)
+        if host and host in allowed_hosts:
+            return RedirectResponse(key)
+        raise HTTPException(status_code=400, detail="This media URL is not allowed")
 
     filename = os.path.basename(key)
     disposition = "attachment" if download else "inline"
@@ -2327,7 +2640,7 @@ def media_file(
 
 
 @app.post("/notes/upload")
-def save_note_data(data: NoteUploadInput, db: Annotated[Session, Depends(get_db)]):
+def save_note_data(data: NoteUploadInput, current_user: Annotated[User, Depends(get_current_user)], db: Annotated[Session, Depends(get_db)]):
     if not data.subcat_id:
         return {"status": "error", "message": "Subject is required"}
 
@@ -2526,7 +2839,7 @@ def get_units(subject_id: int, db: Session = Depends(get_db)):
 
 
 @app.post("/units")
-def create_unit(data: UnitInput, db: Session = Depends(get_db)):
+def create_unit(data: UnitInput, admin: Annotated[User, Depends(require_admin)], db: Session = Depends(get_db)):
     row = Unit(subject_id=data.subject_id, unit_num=data.unit_num, title=data.title)
     db.add(row)
     db.commit()
@@ -2535,7 +2848,7 @@ def create_unit(data: UnitInput, db: Session = Depends(get_db)):
 
 
 @app.put("/units/{unit_id}")
-def update_unit(unit_id: int, data: UnitInput, db: Session = Depends(get_db)):
+def update_unit(unit_id: int, data: UnitInput, admin: Annotated[User, Depends(require_admin)], db: Session = Depends(get_db)):
     row = db.get(Unit, unit_id)
     if not row:
         raise HTTPException(status_code=404, detail="Unit not found")
@@ -2547,7 +2860,7 @@ def update_unit(unit_id: int, data: UnitInput, db: Session = Depends(get_db)):
 
 
 @app.delete("/units/{unit_id}")
-def delete_unit(unit_id: int, db: Session = Depends(get_db)):
+def delete_unit(unit_id: int, admin: Annotated[User, Depends(require_admin)], db: Session = Depends(get_db)):
     row = db.get(Unit, unit_id)
     if not row:
         raise HTTPException(status_code=404, detail="Unit not found")
@@ -2572,8 +2885,13 @@ def get_study_materials(subject_id: int = None, chapter_id: int = None, unit_id:
 
 
 @app.post("/bookmarks")
-def add_bookmark(data: BookmarkInput, db: Session = Depends(get_db)):
-    bookmark = Bookmark(user_id=data.user_id, material_id=data.material_id, pdf_id=data.pdf_id, book_id=data.book_id, title=data.title)
+def add_bookmark(
+    data: BookmarkInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, data.user_id)
+    bookmark = Bookmark(user_id=user_ref(current_user), material_id=data.material_id, pdf_id=data.pdf_id, book_id=data.book_id, title=data.title)
     db.add(bookmark)
     db.commit()
     db.refresh(bookmark)
@@ -2581,14 +2899,24 @@ def add_bookmark(data: BookmarkInput, db: Session = Depends(get_db)):
 
 
 @app.get("/bookmarks")
-def get_bookmarks(user_id: str, db: Session = Depends(get_db)):
+def get_bookmarks(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     rows = db.query(Bookmark).filter(Bookmark.user_id == user_id).order_by(Bookmark.id.desc()).all()
     return [{"id": r.id, "user_id": r.user_id, "material_id": r.material_id, "pdf_id": r.pdf_id, "book_id": r.book_id, "title": r.title, "created_at": fmt_datetime(r.created_at)} for r in rows]
 
 
 @app.post("/personal-notes")
-def add_personal_note(data: PersonalNoteInput, db: Session = Depends(get_db)):
-    note = PersonalNote(user_id=data.user_id, material_id=data.material_id, pdf_id=data.pdf_id, page_no=data.page_no, note_text=data.note_text)
+def add_personal_note(
+    data: PersonalNoteInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, data.user_id)
+    note = PersonalNote(user_id=user_ref(current_user), material_id=data.material_id, pdf_id=data.pdf_id, page_no=data.page_no, note_text=data.note_text)
     db.add(note)
     db.commit()
     db.refresh(note)
@@ -2596,7 +2924,13 @@ def add_personal_note(data: PersonalNoteInput, db: Session = Depends(get_db)):
 
 
 @app.get("/personal-notes")
-def get_personal_notes(user_id: str, pdf_id: int = None, db: Session = Depends(get_db)):
+def get_personal_notes(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    pdf_id: int = None,
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     query = db.query(PersonalNote).filter(PersonalNote.user_id == user_id)
     if pdf_id:
         query = query.filter(PersonalNote.pdf_id == pdf_id)
@@ -2605,35 +2939,56 @@ def get_personal_notes(user_id: str, pdf_id: int = None, db: Session = Depends(g
 
 
 @app.post("/reading-progress")
-def update_reading_progress(data: ReadingProgressInput, db: Session = Depends(get_db)):
-    existing = db.query(ReadingProgress).filter(ReadingProgress.user_id == data.user_id, ReadingProgress.pdf_id == data.pdf_id).first()
+def update_reading_progress(
+    data: ReadingProgressInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, data.user_id)
+    ref = user_ref(current_user)
+    existing = db.query(ReadingProgress).filter(ReadingProgress.user_id == ref, ReadingProgress.pdf_id == data.pdf_id).first()
     if not existing and data.book_id:
-        existing = db.query(ReadingProgress).filter(ReadingProgress.user_id == data.user_id, ReadingProgress.book_id == data.book_id).first()
+        existing = db.query(ReadingProgress).filter(ReadingProgress.user_id == ref, ReadingProgress.book_id == data.book_id).first()
     if existing:
         existing.current_page = data.current_page
         existing.total_pages = data.total_pages
         existing.progress_percent = data.progress_percent
         existing.last_read_at = datetime.utcnow()
     else:
-        existing = ReadingProgress(user_id=data.user_id, material_id=data.material_id, pdf_id=data.pdf_id, book_id=data.book_id, current_page=data.current_page, total_pages=data.total_pages, progress_percent=data.progress_percent)
+        existing = ReadingProgress(user_id=ref, material_id=data.material_id, pdf_id=data.pdf_id, book_id=data.book_id, current_page=data.current_page, total_pages=data.total_pages, progress_percent=data.progress_percent)
         db.add(existing)
     db.commit()
     return {"status": "success"}
 
 
 @app.get("/reading-progress")
-def get_reading_progress(user_id: str, db: Session = Depends(get_db)):
+def get_reading_progress(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     rows = db.query(ReadingProgress).filter(ReadingProgress.user_id == user_id).order_by(ReadingProgress.last_read_at.desc()).all()
     return [{"id": r.id, "user_id": r.user_id, "material_id": r.material_id, "pdf_id": r.pdf_id, "book_id": r.book_id, "current_page": r.current_page, "total_pages": r.total_pages, "progress_percent": r.progress_percent, "last_read_at": fmt_datetime(r.last_read_at)} for r in rows]
 
 
 @app.post("/ai/chat")
-def ai_chat(data: AIChatInput, db: Session = Depends(get_db)):
+def ai_chat(
+    data: AIChatInput,
+    request: Request,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    check_rate_limit(request, "ai-chat", limit=30, window_seconds=300, scope=user_ref(current_user))
+    ensure_own_user(current_user, data.user_id)
+    ref = user_ref(current_user)
     conversation = None
     if data.conversation_id:
         conversation = db.get(AIConversation, data.conversation_id)
+        if conversation and conversation.user_id != ref and not is_admin(current_user):
+            raise HTTPException(status_code=403, detail="You can only access your own conversations")
     if not conversation:
-        conversation = AIConversation(user_id=data.user_id, title=data.question[:60], subject_id=data.subject_id, pdf_id=data.pdf_id)
+        conversation = AIConversation(user_id=ref, title=data.question[:60], subject_id=data.subject_id, pdf_id=data.pdf_id)
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
@@ -2696,13 +3051,27 @@ def ai_chat(data: AIChatInput, db: Session = Depends(get_db)):
 
 
 @app.get("/ai/conversations")
-def ai_conversations(user_id: str, db: Session = Depends(get_db)):
+def ai_conversations(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     rows = db.query(AIConversation).filter(AIConversation.user_id == user_id).order_by(AIConversation.updated_at.desc()).all()
     return [{"id": r.id, "user_id": r.user_id, "title": r.title, "subject_id": r.subject_id, "pdf_id": r.pdf_id, "created_at": fmt_datetime(r.created_at)} for r in rows]
 
 
 @app.get("/ai/messages")
-def ai_messages(conversation_id: int, db: Session = Depends(get_db)):
+def ai_messages(
+    conversation_id: int,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    conversation = db.get(AIConversation, conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+    if conversation.user_id != user_ref(current_user) and not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="You can only access your own conversations")
     rows = db.query(AIMessage).filter(AIMessage.conversation_id == conversation_id).order_by(AIMessage.id).all()
     return [{"id": r.id, "conversation_id": r.conversation_id, "role": r.role, "content": r.content, "sources": r.sources, "created_at": fmt_datetime(r.created_at)} for r in rows]
 
@@ -2752,9 +3121,13 @@ def get_mock_tests(semester: int = None, subject_id: int = None, db: Session = D
 
 
 @app.post("/mock-tests/start")
-def start_mock_test(data: dict, db: Session = Depends(get_db)):
+def start_mock_test(
+    data: dict,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
     mock_test_id = data.get("mock_test_id")
-    user_id = data.get("user_id")
+    user_id = user_ref(current_user)
     attempt = TestAttempt(user_id=user_id, mock_test_id=mock_test_id, attempt_type="mock")
     db.add(attempt)
     db.commit()
@@ -2764,8 +3137,12 @@ def start_mock_test(data: dict, db: Session = Depends(get_db)):
 
 
 @app.post("/mock-tests/submit")
-def submit_mock_test(data: dict, db: Session = Depends(get_db)):
-    user_id = data.get("user_id")
+def submit_mock_test(
+    data: dict,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    user_id = user_ref(current_user)
     mock_test_id = data.get("mock_test_id")
     score = float(data.get("score", 0))
     total = float(data.get("total", 0))
@@ -2789,13 +3166,23 @@ def submit_mock_test(data: dict, db: Session = Depends(get_db)):
 
 
 @app.get("/test-results")
-def get_test_results(user_id: str, db: Session = Depends(get_db)):
+def get_test_results(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     rows = db.query(TestResult).filter(TestResult.user_id == user_id).order_by(TestResult.id.desc()).all()
     return [{"id": r.id, "user_id": r.user_id, "test_name": r.test_name, "subject": r.subject, "score": r.score, "total": r.total, "percentage": r.percentage, "created_at": fmt_datetime(r.created_at)} for r in rows]
 
 
 @app.get("/student-progress")
-def get_student_progress(user_id: str, db: Session = Depends(get_db)):
+def get_student_progress(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     progress = db.query(StudentProgress).filter(StudentProgress.user_id == user_id).first()
     if not progress:
         return {"total_tests": 0, "average_score": 0, "pdf_read_count": 0, "bookmarked_questions": 0}
@@ -2803,13 +3190,23 @@ def get_student_progress(user_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/quiz-history")
-def get_quiz_history(user_id: str, db: Session = Depends(get_db)):
+def get_quiz_history(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     rows = db.query(TestResult).filter(TestResult.user_id == user_id).order_by(TestResult.id.desc()).limit(20).all()
     return [{"id": r.id, "test_name": r.test_name, "subject": r.subject, "score": r.score, "total": r.total, "percentage": r.percentage, "created_at": fmt_datetime(r.created_at)} for r in rows]
 
 
 @app.get("/learning-activity")
-def get_learning_activity(user_id: str, db: Session = Depends(get_db)):
+def get_learning_activity(
+    user_id: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
+    ensure_own_user(current_user, user_id)
     bookmarks = db.query(Bookmark).filter(Bookmark.user_id == user_id).count()
     notes = db.query(PersonalNote).filter(PersonalNote.user_id == user_id).count()
     reads = db.query(ReadingProgress).filter(ReadingProgress.user_id == user_id).count()
@@ -2837,10 +3234,15 @@ def _active_user_ids_since(db: Session, since: datetime):
 
 
 @app.post("/downloads", status_code=201)
-def track_download(data: DownloadInput, db: Session = Depends(get_db)):
+def track_download(
+    data: DownloadInput,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Session = Depends(get_db),
+):
     content_type = (data.content_type or "Unknown").strip()[:50] or "Unknown"
     title = (data.title or "").strip()[:255] or None
-    user_id = (data.user_id or "").strip() or None
+    ensure_own_user(current_user, data.user_id)
+    user_id = user_ref(current_user)
 
     event = DownloadEvent(
         user_id=user_id,
@@ -2855,7 +3257,7 @@ def track_download(data: DownloadInput, db: Session = Depends(get_db)):
 
 
 @app.get("/admin/analytics")
-def admin_analytics(db: Session = Depends(get_db)):
+def admin_analytics(admin: Annotated[User, Depends(require_admin)], db: Session = Depends(get_db)):
     now = datetime.utcnow()
     today_start = datetime(now.year, now.month, now.day)
     week_start = now - timedelta(days=7)
@@ -3097,7 +3499,12 @@ def _llm_translate_batch(texts: List[str], target_lang: str) -> Optional[List[st
 
 
 @app.post("/translate")
-def translate_texts(data: TranslateInput, db: Annotated[Session, Depends(get_db)]):
+def translate_texts(
+    data: TranslateInput,
+    request: Request,
+    db: Annotated[Session, Depends(get_db)],
+):
+    check_rate_limit(request, "translate", limit=60, window_seconds=300)
     target_lang = (data.target_lang or "").strip().lower()
     texts = list(data.texts or [])
 
