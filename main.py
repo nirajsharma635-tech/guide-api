@@ -23,6 +23,7 @@ import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from jwt.exceptions import InvalidTokenError
@@ -2266,6 +2267,63 @@ def media_url(
         raise HTTPException(status_code=401, detail="Login required")
 
     return {"url": build_media_url(key), "expires_in": S3_URL_TTL_SECONDS}
+
+
+@app.get("/media/file")
+def media_file(
+    key: str = Query(..., description="Stored object key, e.g. 1712_ab12_notes.pdf"),
+    download: bool = Query(False),
+    user_id: Optional[str] = Query(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(HTTPBearer(auto_error=False)),
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    """Stream a stored PDF through the API (avoids browser CORS issues).
+
+    Same login/paid-user check as /media/url.
+    """
+    if not key:
+        raise HTTPException(status_code=400, detail="key is required")
+
+    authorized = False
+    if credentials is not None:
+        try:
+            payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=["HS256"])
+            authorized = db.get(User, int(payload["sub"])) is not None
+        except (InvalidTokenError, ValueError, KeyError):
+            authorized = False
+
+    if not authorized and user_id:
+        authorized = db.query(User).filter(User.user_id == user_id).first() is not None
+
+    if not authorized:
+        raise HTTPException(status_code=401, detail="Login required")
+
+    if re.match(r"^https?://", key, re.IGNORECASE):
+        return RedirectResponse(key)
+
+    filename = os.path.basename(key)
+    disposition = "attachment" if download else "inline"
+    headers = {
+        "Content-Disposition": f'{disposition}; filename="{filename}"',
+        "Cache-Control": "private, max-age=300",
+    }
+
+    if S3_ENABLED:
+        try:
+            obj = get_s3_client().get_object(Bucket=S3_BUCKET, Key=key.lstrip("/"))
+            return StreamingResponse(
+                obj["Body"],
+                media_type=obj.get("ContentType") or "application/pdf",
+                headers=headers,
+            )
+        except Exception as exc:
+            print(f"S3 stream failed, falling back to local disk: {exc}")
+
+    local_path = os.path.join(UPLOAD_DIR, filename)
+    if os.path.isfile(local_path):
+        return FileResponse(local_path, media_type="application/pdf", headers=headers)
+
+    raise HTTPException(status_code=404, detail="File not found")
 
 
 @app.post("/notes/upload")
