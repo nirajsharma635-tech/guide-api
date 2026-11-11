@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import io
 import json
 import mimetypes
 import os
@@ -40,6 +41,11 @@ try:
 except ImportError:  # object storage optional; local disk fallback rahega
     boto3 = None
     BotoConfig = None
+
+try:
+    from pypdf import PdfReader
+except ImportError:  # PDF text extraction optional; upload chalega, text nahi banega
+    PdfReader = None
 
 load_dotenv()
 
@@ -312,6 +318,8 @@ class Practical(Base):
     syllabus_title: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     syllabusPdf: Mapped[Optional[str]] = mapped_column("syllabus_pdf", String(255), nullable=True)
     solutionPdf: Mapped[Optional[str]] = mapped_column("solution_pdf", String(255), nullable=True)
+    manual_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    solution_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
 
 class Video(Base):
@@ -745,6 +753,30 @@ except Exception as exc:
     print(f"Warning: could not migrate subcategories table automatically: {exc}")
 
 
+def ensure_practical_columns():
+    inspector = inspect(engine)
+    if "practicals" not in inspector.get_table_names():
+        return
+
+    existing = {column["name"] for column in inspector.get_columns("practicals")}
+    additions = {
+        "manual_text": "TEXT",
+        "solution_text": "TEXT",
+    }
+    with engine.begin() as connection:
+        for column, ddl_type in additions.items():
+            if column not in existing:
+                connection.execute(
+                    text(f'ALTER TABLE practicals ADD COLUMN "{column}" {ddl_type}')
+                )
+
+
+try:
+    ensure_practical_columns()
+except Exception as exc:
+    print(f"Warning: could not migrate practicals table automatically: {exc}")
+
+
 BSCIT_SUBJECTS = {
     1: [
         "Imperative Programming",
@@ -987,6 +1019,8 @@ class PracticalInput(BaseModel):
     syllabus_title: Optional[str] = None
     syllabusPdf: Optional[str] = None
     solutionPdf: Optional[str] = None
+    manualText: Optional[str] = None
+    solutionText: Optional[str] = None
 
 
 class UnitInput(BaseModel):
@@ -1316,6 +1350,55 @@ def save_upload(upload: UploadFile, allowed_extensions: set) -> str:
         shutil.copyfileobj(upload.file, output)
 
     return filename
+
+
+def read_stored_bytes(key: str) -> Optional[bytes]:
+    """Stored file bytes nikalo (S3 pehle, phir local uploads/ fallback)."""
+    if not key:
+        return None
+    if re.match(r"^https?://", key, re.IGNORECASE):
+        return None
+    if S3_ENABLED:
+        try:
+            obj = get_s3_client().get_object(Bucket=S3_BUCKET, Key=key.lstrip("/"))
+            return obj["Body"].read()
+        except Exception as exc:
+            print(f"S3 read failed for text extraction, trying local disk: {exc}")
+    local_path = os.path.join(UPLOAD_DIR, os.path.basename(key))
+    if os.path.isfile(local_path):
+        try:
+            with open(local_path, "rb") as handle:
+                return handle.read()
+        except Exception as exc:
+            print(f"Local read failed for text extraction ({key}): {exc}")
+    return None
+
+
+def extract_pdf_text(key: str) -> Optional[str]:
+    """Stored PDF se pypdf text nikalo. Scanned/corrupt PDF pe None."""
+    if not key or PdfReader is None:
+        return None
+    if os.path.splitext(key.lower())[1] != ".pdf":
+        return None
+
+    data = read_stored_bytes(key)
+    if not data:
+        return None
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        parts = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            page_text = re.sub(r"[ \t]+", " ", page_text)
+            page_text = re.sub(r"\n{3,}", "\n\n", page_text)
+            if page_text.strip():
+                parts.append(page_text.strip())
+        combined = "\n\n".join(parts).strip()
+        return combined if len(combined) >= 40 else None  # scanned PDF guard
+    except Exception as exc:
+        print(f"PDF text extraction failed for {key}: {exc}")
+        return None
 
 
 def build_media_url(key: str, expires: int = None) -> str:
@@ -1866,6 +1949,8 @@ def get_practicals(subcat_id: Optional[int] = None, db: Annotated[Session, Depen
                 "syllabus_title": row.syllabus_title,
                 "syllabusPdf": row.syllabusPdf,
                 "solutionPdf": row.solutionPdf,
+                "manualText": row.manual_text,
+                "solutionText": row.solution_text,
             }
             for row in rows
         ],
@@ -1879,6 +1964,8 @@ def create_practical(data: PracticalInput, admin: Annotated[User, Depends(requir
         syllabus_title=data.syllabus_title,
         syllabusPdf=data.syllabusPdf,
         solutionPdf=data.solutionPdf,
+        manual_text=(data.manualText or "").strip() or extract_pdf_text(data.syllabusPdf or ""),
+        solution_text=(data.solutionText or "").strip() or extract_pdf_text(data.solutionPdf or ""),
     )
     db.add(row)
     db.commit()
@@ -1893,8 +1980,24 @@ def update_practical(practical_id: int, data: PracticalInput, admin: Annotated[U
         raise HTTPException(status_code=404, detail="Practical not found")
     row.subcat_id = data.subcat_id
     row.syllabus_title = data.syllabus_title
+
+    old_syllabus_pdf = row.syllabusPdf
+    old_solution_pdf = row.solutionPdf
     row.syllabusPdf = data.syllabusPdf
     row.solutionPdf = data.solutionPdf
+
+    manual_override = (data.manualText or "").strip()
+    if manual_override:
+        row.manual_text = manual_override
+    elif data.syllabusPdf and data.syllabusPdf != old_syllabus_pdf:
+        row.manual_text = extract_pdf_text(data.syllabusPdf) or row.manual_text
+
+    solution_override = (data.solutionText or "").strip()
+    if solution_override:
+        row.solution_text = solution_override
+    elif data.solutionPdf and data.solutionPdf != old_solution_pdf:
+        row.solution_text = extract_pdf_text(data.solutionPdf) or row.solution_text
+
     db.commit()
     return {"status": "success", "data": {"id": row.id}}
 

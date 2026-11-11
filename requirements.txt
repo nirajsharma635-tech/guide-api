@@ -8,3 +8,4 @@ email-validator
 psycopg[binary]
 python-multipart
 boto3
+pypdf
