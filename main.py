@@ -59,6 +59,8 @@ def allowed_origins() -> List[str]:
     if configured:
         return configured
     return [
+        "http://localhost",
+        "https://localhost",
         "http://localhost:3000",
         "http://localhost:5173",
         "http://localhost:8100",
@@ -70,9 +72,9 @@ def allowed_origins() -> List[str]:
 app = FastAPI(
     title="Guide API",
     version="1.0.0",
-    docs_url=None if _IS_PROD else "/docs",
-    redoc_url=None if _IS_PROD else "/redoc",
-    openapi_url=None if _IS_PROD else "/openapi.json",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
 )
 
 app.add_middleware(
