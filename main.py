@@ -33,6 +33,7 @@ from jwt.exceptions import InvalidTokenError
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
 from sqlalchemy import DateTime, Float, Integer, String, Text, UniqueConstraint, and_, create_engine, func, inspect, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 try:
@@ -1033,6 +1034,29 @@ class SyllabusTopicInput(BaseModel):
     subcat_id: int
     unit: int = 1
     topic: str
+
+
+class SyllabusStatusUpdate(BaseModel):
+    topic_id: int
+    status: str
+    user_id: Optional[str] = None
+
+
+SYLLABUS_STATUS_MAP = {
+    "pending": "Pending",
+    "active": "Active",
+    "success": "Success",
+    "completed": "Success",
+    "done": "Success",
+}
+
+
+def normalize_syllabus_status(value: Optional[str]) -> str:
+    return SYLLABUS_STATUS_MAP.get((value or "").strip().lower(), "Pending")
+
+
+def is_valid_syllabus_status(value: Optional[str]) -> bool:
+    return (value or "").strip().lower() in SYLLABUS_STATUS_MAP
 
 
 def get_db():
@@ -2137,17 +2161,20 @@ def get_syllabus_topics(
     user_id: Optional[str] = None,
     db: Annotated[Session, Depends(get_db)] = None,
 ):
-    if user_id:
-        if current_user is None:
-            raise HTTPException(status_code=401, detail="Login required")
+    effective_user_id = user_id
+    if current_user is not None:
         ensure_own_user(current_user, user_id)
+        if not effective_user_id:
+            effective_user_id = user_ref(current_user)
+    elif user_id:
+        raise HTTPException(status_code=401, detail="Login required")
 
     topics = db.query(SyllabusTopic).filter(SyllabusTopic.subcat_id == subcat_id).order_by(SyllabusTopic.unit, SyllabusTopic.id).all()
 
     status_map = {}
-    if user_id:
-        status_rows = db.query(SyllabusStatus).filter(SyllabusStatus.user_id == user_id).all()
-        status_map = {row.topic_id: row.status for row in status_rows}
+    if effective_user_id:
+        status_rows = db.query(SyllabusStatus).filter(SyllabusStatus.user_id == effective_user_id).all()
+        status_map = {row.topic_id: normalize_syllabus_status(row.status) for row in status_rows}
 
     result = {f"unit_{unit}": [] for unit in range(1, 6)}
     for topic in topics:
@@ -2174,6 +2201,19 @@ def create_syllabus_topic(data: SyllabusTopicInput, admin: Annotated[User, Depen
     return {"status": "success", "data": {"id": row.id}}
 
 
+@app.put("/syllabus/topics/{topic_id}")
+def update_syllabus_topic(topic_id: int, data: SyllabusTopicInput, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
+    row = db.get(SyllabusTopic, topic_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Syllabus topic not found")
+    row.subcat_id = data.subcat_id
+    row.unit = data.unit
+    row.topic = data.topic
+    db.commit()
+    db.refresh(row)
+    return {"status": "success", "data": {"id": row.id}}
+
+
 @app.delete("/syllabus/topics/{topic_id}")
 def delete_syllabus_topic(topic_id: int, admin: Annotated[User, Depends(require_admin)], db: Annotated[Session, Depends(get_db)]):
     row = db.get(SyllabusTopic, topic_id)
@@ -2182,6 +2222,47 @@ def delete_syllabus_topic(topic_id: int, admin: Annotated[User, Depends(require_
     db.delete(row)
     db.commit()
     return {"status": "success", "message": "Syllabus topic deleted"}
+
+
+@app.post("/syllabus/status")
+def update_syllabus_status(
+    data: SyllabusStatusUpdate,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)] = None,
+):
+    effective_user_id = data.user_id or user_ref(current_user)
+    ensure_own_user(current_user, effective_user_id)
+    if not is_valid_syllabus_status(data.status):
+        raise HTTPException(status_code=400, detail="Invalid syllabus status")
+    topic = db.get(SyllabusTopic, data.topic_id)
+    if not topic:
+        raise HTTPException(status_code=404, detail="Syllabus topic not found")
+
+    normalized_status = normalize_syllabus_status(data.status)
+    record = (
+        db.query(SyllabusStatus)
+        .filter(SyllabusStatus.user_id == effective_user_id, SyllabusStatus.topic_id == data.topic_id)
+        .first()
+    )
+    if record:
+        record.status = normalized_status
+    else:
+        db.add(SyllabusStatus(user_id=effective_user_id, topic_id=data.topic_id, status=normalized_status))
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        record = (
+            db.query(SyllabusStatus)
+            .filter(SyllabusStatus.user_id == effective_user_id, SyllabusStatus.topic_id == data.topic_id)
+            .first()
+        )
+        if record is None:
+            raise
+        record.status = normalized_status
+        db.commit()
+
+    return {"status": True, "data": {"topic_id": data.topic_id, "status": normalized_status}}
 
 
 @app.get("/syllabus/status")
@@ -2193,15 +2274,21 @@ def set_syllabus_status(
     db: Annotated[Session, Depends(get_db)] = None,
 ):
     ensure_own_user(current_user, user_id)
+    if not is_valid_syllabus_status(status):
+        raise HTTPException(status_code=400, detail="Invalid syllabus status")
+    if db.get(SyllabusTopic, subcat_id) is None:
+        raise HTTPException(status_code=404, detail="Syllabus topic not found")
+
+    normalized_status = normalize_syllabus_status(status)
     record = (
         db.query(SyllabusStatus)
         .filter(SyllabusStatus.user_id == user_id, SyllabusStatus.topic_id == subcat_id)
         .first()
     )
     if record:
-        record.status = status
+        record.status = normalized_status
     else:
-        db.add(SyllabusStatus(user_id=user_id, topic_id=subcat_id, status=status))
+        db.add(SyllabusStatus(user_id=user_id, topic_id=subcat_id, status=normalized_status))
     db.commit()
     return {"status": True, "message": "Status updated successfully"}
 
